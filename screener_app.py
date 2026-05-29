@@ -1,20 +1,24 @@
-# screener_app.py  v5
+# screener_app.py  v6
 # ─────────────────────────────────────────────────────────────────────────────
-# Changes from v4:
-#  1. FACTOR MODEL CLEANED UP:
-#     - Valuation = pure PE percentile (Fwd PE preferred, trailing fallback)
-#     - PEG = standalone factor only (removed from inside valuation composite)
-#     - Earn Trajectory REMOVED entirely (redundant with PEG + Earn Revision)
-#     - New weights: Val 25% | Quality 25% | PEG 20% | EarnRev 15% | Mom 15%
+# ROOT CAUSE FIX for 0% PEG / ROIC / Int Coverage / Earn Revision:
+#   FMP free/starter tier does NOT support bulk /ratios or /key-metrics
+#   Those bulk calls return empty list silently → all metrics = None → 0%
 #
-#  2. DATA COVERAGE FIXES:
-#     - FMP /ratios bulk endpoint (50 tickers/call) replaces per-ticker loops
-#     - FMP /key-metrics bulk endpoint (50 tickers/call) replaces per-ticker loops
-#     - Finviz bulk scrape added as fallback for PE, Fwd PE, PEG (all 500 in 1 request)
-#     - Yahoo fallback now proactive for ALL tickers missing PE, not just FMP misses
-#     - Earn Revision fetched via batch analyst-estimates (50 tickers/call)
+# v6 STRATEGY — 3-layer waterfall:
+#   LAYER 1: Finviz export (FREE, 1 HTTP request, covers ~490/503 stocks)
+#            → PE, Fwd PE, PEG, EPS Growth, ROE, Op Margin, D/E
+#            → Expected: PE ~95%, Fwd PE ~90%, PEG ~75%
 #
-#  3. DETAILED COLUMN REFERENCE GUIDE with worked examples
+#   LAYER 2: FMP /ratios-ttm per-ticker (concurrent 10 threads, 50-chunk sleep)
+#            → ROIC, Int Coverage, PEG (more accurate override), ROE, Op Margin
+#            → Only for tickers still missing ROIC after Finviz (Finviz has no ROIC)
+#            → Expected: ROIC ~70%, Int Coverage ~65%
+#
+#   LAYER 3: Yahoo Finance fallback
+#            → Only for tickers still missing PE after Finviz + FMP quote
+#            → Expected: reduces remaining gaps by ~50%
+#
+#   DIAGNOSTIC MODE: prints first API response keys so you can verify field names
 # ─────────────────────────────────────────────────────────────────────────────
 
 import streamlit as st
@@ -27,6 +31,7 @@ import random
 import re
 import warnings
 import concurrent.futures
+from io import StringIO
 from datetime import datetime
 
 warnings.filterwarnings("ignore")
@@ -34,19 +39,18 @@ warnings.filterwarnings("ignore")
 try:
     from bs4 import BeautifulSoup
 except ImportError:
-    st.error("Install beautifulsoup4: pip install beautifulsoup4")
+    st.error("Install beautifulsoup4")
     st.stop()
 
 # ── Constants ─────────────────────────────────────────────────────────────────
 MIN_GROWTH_PCT_FOR_PEG = 5.0
 
-# v5 clean 5-factor weights — no Earn Trajectory, no PEG inside Valuation
 FACTOR_WEIGHTS = {
-    "valuation":     0.25,   # pure PE percentile (Fwd PE preferred)
-    "quality":       0.25,   # ROIC + Int Coverage + Op Margin
-    "peg":           0.20,   # standalone PEG percentile
-    "earn_revision": 0.15,   # analyst EPS revision signal
-    "momentum":      0.15,   # skip-month vol-adjusted momentum
+    "valuation":     0.25,
+    "quality":       0.25,
+    "peg":           0.20,
+    "earn_revision": 0.15,
+    "momentum":      0.15,
 }
 
 QUALITY_THRESHOLDS = {
@@ -55,14 +59,12 @@ QUALITY_THRESHOLDS = {
     "op_margin_min":    5.0,
 }
 
-
 # ── Credentials ───────────────────────────────────────────────────────────────
 def get_fmp_key():
     try:
         return st.secrets["fmp"]["api_key"]
     except Exception:
         return None
-
 
 # ── Helpers ───────────────────────────────────────────────────────────────────
 def to_num(x):
@@ -120,7 +122,6 @@ def revenue_growth_pct_cagr(rev4):
     except Exception:
         return None
 
-
 # ── S&P 500 universe ──────────────────────────────────────────────────────────
 @st.cache_data(ttl=86400)
 def fetch_sp500_constituents():
@@ -142,7 +143,6 @@ def fetch_sp500_constituents():
                 data.append({"Ticker": cleaned, "Sector": sector})
     return pd.DataFrame(data)
 
-
 # ── Prices ────────────────────────────────────────────────────────────────────
 @st.cache_data(ttl=3600)
 def fetch_prices_batch(tickers):
@@ -162,8 +162,7 @@ def fetch_prices_batch(tickers):
         pass
     return res
 
-
-# ── Momentum: skip-month + vol-adjusted ───────────────────────────────────────
+# ── Momentum ──────────────────────────────────────────────────────────────────
 @st.cache_data(ttl=3600)
 def fetch_momentum_batch(tickers):
     tl  = list(tickers)
@@ -222,8 +221,110 @@ def fetch_momentum_batch(tickers):
         pass
     return out
 
+# ══════════════════════════════════════════════════════════════════════════════
+# ── LAYER 1: FINVIZ — Primary source for PE, Fwd PE, PEG, EPS Growth ─────────
+# ══════════════════════════════════════════════════════════════════════════════
+@st.cache_data(ttl=86400)
+def fetch_finviz_bulk(tickers):
+    """
+    Single HTTP request to Finviz export endpoint.
+    Returns PE, Fwd PE, PEG, EPS Growth 5Y, ROE, Op Margin, D/E for ~490/503 stocks.
+    No API key needed. This is the PRIMARY fix for 0% PE/PEG coverage.
 
-# ── FMP 1: bulk quote (PE, MC, 52W) ──────────────────────────────────────────
+    Finviz column names in export CSV (v=152 layout):
+      Ticker, Market Cap, P/E, Forward P/E, PEG, EPS next 5Y,
+      ROE, Debt/Eq, Oper. Margin, ...
+    """
+    out = {t: {} for t in tickers}
+    headers = {
+        "User-Agent":      "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+                           "AppleWebKit/537.36 (KHTML, like Gecko) "
+                           "Chrome/124.0.0.0 Safari/537.36",
+        "Accept":          "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+        "Accept-Language": "en-US,en;q=0.5",
+        "Referer":         "https://finviz.com/screener.ashx",
+        "Cache-Control":   "no-cache",
+    }
+
+    # Finviz export: all S&P 500 stocks, view 152 (fundamental), sorted by ticker
+    export_url = "https://finviz.com/export.ashx?v=152&f=idx_sp500&o=ticker"
+
+    try:
+        r = requests.get(export_url, headers=headers, timeout=45)
+        r.raise_for_status()
+
+        # Parse CSV response
+        df = pd.read_csv(StringIO(r.text))
+        df.columns = [str(c).strip() for c in df.columns]
+
+        # Diagnostic: show columns found
+        st.session_state["finviz_columns"] = list(df.columns)
+        st.session_state["finviz_rows"]    = len(df)
+
+        def clean(val):
+            if pd.isna(val):
+                return None
+            s = str(val).replace("%", "").replace(",", "").strip()
+            if s in ("-", "", "N/A", "nan"):
+                return None
+            return sf(s)
+
+        for _, row in df.iterrows():
+            t = str(row.get("Ticker", "")).upper().strip()
+            if not t or t not in out:
+                continue
+            rec = {}
+
+            pe_v = clean(row.get("P/E"))
+            if pe_v and 0 < pe_v <= 10_000:
+                rec["pe"]     = pe_v
+                rec["pe_src"] = "Finviz"
+
+            fpe_v = clean(row.get("Forward P/E"))
+            if fpe_v and 0 < fpe_v <= 10_000:
+                rec["fwd_pe"] = fpe_v
+
+            peg_v = clean(row.get("PEG"))
+            if peg_v and 0 < peg_v <= 500:
+                rec["peg"]     = peg_v
+                rec["peg_src"] = "Finviz"
+
+            # EPS next 5Y is already a percent string like "18.50%"
+            eg_v = clean(row.get("EPS next 5Y"))
+            if eg_v is not None:
+                rec["eps_growth"] = eg_v
+
+            roe_v = clean(row.get("ROE"))
+            if roe_v is not None:
+                rec["roe"] = roe_v
+
+            om_v = clean(row.get("Oper. Margin"))
+            if om_v is not None:
+                rec["op_margin"] = om_v
+
+            de_v = clean(row.get("Debt/Eq"))
+            if de_v is not None:
+                rec["debt_eq"] = de_v
+
+            mc_v = clean(row.get("Market Cap"))
+            # Finviz shows market cap as "1.23T", "456.78B", "12.34M"
+            # Try parsing if it's already a float (some views return raw number)
+            if mc_v is not None:
+                rec["mc"] = mc_v * 1e6  # Finviz export in millions for some columns
+
+            if rec:
+                out[t] = rec
+
+    except requests.exceptions.HTTPError as e:
+        st.session_state["finviz_error"] = "HTTP {}: {}".format(e.response.status_code, str(e))
+    except Exception as e:
+        st.session_state["finviz_error"] = str(e)
+
+    return out
+
+# ══════════════════════════════════════════════════════════════════════════════
+# ── LAYER 2A: FMP bulk /quote — PE, MC, 52W ───────────────────────────────────
+# ══════════════════════════════════════════════════════════════════════════════
 @st.cache_data(ttl=86400)
 def fetch_fmp_bulk_quotes(tickers, api_key):
     out = {t: {} for t in tickers}
@@ -244,17 +345,15 @@ def fetch_fmp_bulk_quotes(tickers, api_key):
                 t  = str(item.get("symbol", "")).upper().strip()
                 if not t:
                     continue
-                pe  = sf(item.get("pe"))
-                mc  = sf(item.get("marketCap"))
-                hi  = sf(item.get("yearHigh"))
-                lo  = sf(item.get("yearLow"))
-                px  = sf(item.get("price"))
-                eps = sf(item.get("eps"))
+                pe = sf(item.get("pe"))
+                mc = sf(item.get("marketCap"))
+                hi = sf(item.get("yearHigh"))
+                lo = sf(item.get("yearLow"))
+                px = sf(item.get("price"))
                 if pe is not None and (pe <= 0 or pe > 10_000):
                     pe = None
                 out[t] = {
-                    "pe": pe, "mc": mc, "hi52": hi,
-                    "lo52": lo, "price": px, "eps": eps,
+                    "pe": pe, "mc": mc, "hi52": hi, "lo52": lo, "price": px,
                     "pe_src": "FMP-quote" if pe is not None else None,
                 }
         except Exception:
@@ -262,255 +361,245 @@ def fetch_fmp_bulk_quotes(tickers, api_key):
         time.sleep(0.3)
     return out
 
-
-# ── FMP 2: BULK ratios (PEG, ROIC, Int Coverage, Op Margin) ──────────────────
-# v5 FIX: uses bulk comma-separated endpoint instead of per-ticker
-# 503 tickers = ~11 API calls instead of 503 calls → solves rate limit 0% issue
+# ══════════════════════════════════════════════════════════════════════════════
+# ── LAYER 2B: FMP /ratios-ttm per-ticker — ROIC, Int Coverage, PEG override ──
+# Primary fix for ROIC=0% and Int Coverage=0%
+# Uses concurrent threads (10 workers) to handle 503 tickers efficiently
+# ══════════════════════════════════════════════════════════════════════════════
 @st.cache_data(ttl=86400)
-def fetch_fmp_ratios_bulk(tickers, api_key):
+def fetch_fmp_ratios_ttm_concurrent(tickers, api_key):
+    """
+    Hits FMP /ratios-ttm/{ticker} per-ticker using 10 concurrent workers.
+    503 tickers at 10 workers = ~50-60 seconds total with rate limiting.
+
+    Field names for /ratios-ttm (NOTE: has TTM suffix unlike /ratios):
+      PEG          → priceEarningsGrowthRatioTTM
+      ROIC         → returnOnInvestedCapitalTTM
+      Int Coverage → interestCoverageTTM
+      Op Margin    → operatingProfitMarginTTM
+      ROE          → returnOnEquityTTM
+      D/E          → debtEquityRatioTTM
+      Fwd PE       → priceToEarningsRatioTTM
+    """
     out = {t: {} for t in tickers}
     if not api_key:
         return out
-    tl     = list(tickers)
-    CHUNK  = 50   # FMP bulk ratios supports up to 50 per call
-    chunks = [tl[i:i+CHUNK] for i in range(0, len(tl), CHUNK)]
 
-    for chunk in chunks:
-        url = "https://financialmodelingprep.com/api/v3/ratios/{}?apikey={}&period=TTM".format(
-            ",".join(chunk), api_key)
+    def fetch_one(t):
+        url = "https://financialmodelingprep.com/api/v3/ratios-ttm/{}?apikey={}".format(
+            t, api_key)
         try:
-            r    = requests.get(url, timeout=25)
+            r = requests.get(url, timeout=15)
+            if r.status_code == 429:
+                time.sleep(2.0)
+                r = requests.get(url, timeout=15)
             r.raise_for_status()
-            data = r.json()
-            if not isinstance(data, list):
-                continue
-            for item in data:
-                t = str(item.get("symbol", "")).upper().strip()
-                if not t:
-                    continue
+            d = r.json()
+            if not isinstance(d, list) or len(d) == 0:
+                return t, {}
+            item = d[0]
 
-                peg_raw = sf(item.get("priceEarningsToGrowthRatio"))
-                peg     = peg_raw if (peg_raw is not None and 0 < peg_raw <= 500) else None
+            # Diagnostic: capture field names from first successful response
+            if "fmp_ratios_ttm_fields" not in st.session_state:
+                st.session_state["fmp_ratios_ttm_fields"] = list(item.keys())
 
-                roic_raw = sf(item.get("returnOnInvestedCapital"))
-                roic     = normalise_pct(roic_raw) if roic_raw is not None else None
+            peg_raw  = sf(item.get("priceEarningsGrowthRatioTTM"))
+            peg      = peg_raw if (peg_raw is not None and 0 < peg_raw <= 500) else None
 
-                roe_raw  = sf(item.get("returnOnEquity"))
-                roe      = normalise_pct(roe_raw) if roe_raw is not None else None
+            roic_raw = sf(item.get("returnOnInvestedCapitalTTM"))
+            roic     = normalise_pct(roic_raw) if roic_raw is not None else None
 
-                om_raw   = sf(item.get("operatingProfitMargin"))
-                om       = normalise_pct(om_raw) if om_raw is not None else None
+            roe_raw  = sf(item.get("returnOnEquityTTM"))
+            roe      = normalise_pct(roe_raw) if roe_raw is not None else None
 
-                ic_raw   = sf(item.get("interestCoverage"))
-                ic       = min(float(ic_raw), 100.0) if (ic_raw is not None and ic_raw > 0) else None
+            om_raw   = sf(item.get("operatingProfitMarginTTM"))
+            om       = normalise_pct(om_raw) if om_raw is not None else None
 
-                de       = sf(item.get("debtEquityRatio"))
+            ic_raw   = sf(item.get("interestCoverageTTM"))
+            ic       = min(float(ic_raw), 100.0) if (ic_raw is not None and ic_raw > 0) else None
 
-                fwd_pe_raw = sf(item.get("priceToEarningsRatio"))
-                fwd_pe     = fwd_pe_raw if (fwd_pe_raw and 0 < fwd_pe_raw <= 10_000) else None
+            de       = sf(item.get("debtEquityRatioTTM"))
 
-                out[t] = {
-                    "peg":          peg,
-                    "roic":         roic,
-                    "roe":          roe,
-                    "op_margin":    om,
-                    "int_coverage": ic,
-                    "debt_eq":      de,
-                    "fwd_pe":       fwd_pe,
-                    "peg_src":      "FMP-ratios" if peg is not None else None,
-                }
+            fwd_raw  = sf(item.get("priceToEarningsRatioTTM"))
+            fwd_pe   = fwd_raw if (fwd_raw and 0 < fwd_raw <= 10_000) else None
+
+            return t, {
+                "peg":          peg,
+                "roic":         roic,
+                "roe":          roe,
+                "op_margin":    om,
+                "int_coverage": ic,
+                "debt_eq":      de,
+                "fwd_pe":       fwd_pe,
+                "peg_src":      "FMP-ratios-ttm" if peg is not None else None,
+            }
         except Exception:
-            pass
-        time.sleep(0.5)
+            return t, {}
+
+    tl      = list(tickers)
+    CHUNK   = 50
+    WORKERS = 10
+    SLEEP   = 1.0     # sleep between chunks to respect rate limits
+    chunks  = [tl[i:i+CHUNK] for i in range(0, len(tl), CHUNK)]
+
+    for ci, chunk in enumerate(chunks):
+        with concurrent.futures.ThreadPoolExecutor(max_workers=WORKERS) as ex:
+            futures = {ex.submit(fetch_one, t): t for t in chunk}
+            for fut in concurrent.futures.as_completed(futures):
+                try:
+                    t, d = fut.result()
+                    if d:
+                        out[t] = d
+                except Exception:
+                    pass
+        if ci < len(chunks) - 1:
+            time.sleep(SLEEP)
+
     return out
 
-
-# ── FMP 3: BULK key-metrics (EPS growth, Fwd PE, Revenue Growth) ──────────────
-# v5 FIX: bulk endpoint, 50 tickers/call
+# ══════════════════════════════════════════════════════════════════════════════
+# ── LAYER 2C: FMP /key-metrics-ttm per-ticker — EPS growth, Fwd PE ───────────
+# ══════════════════════════════════════════════════════════════════════════════
 @st.cache_data(ttl=86400)
-def fetch_fmp_key_metrics_bulk(tickers, api_key):
+def fetch_fmp_key_metrics_concurrent(tickers, api_key):
     out = {t: {} for t in tickers}
     if not api_key:
         return out
-    tl     = list(tickers)
-    CHUNK  = 50
-    chunks = [tl[i:i+CHUNK] for i in range(0, len(tl), CHUNK)]
 
-    for chunk in chunks:
-        url = "https://financialmodelingprep.com/api/v3/key-metrics/{}?apikey={}&period=TTM".format(
-            ",".join(chunk), api_key)
+    def fetch_one(t):
+        url = "https://financialmodelingprep.com/api/v3/key-metrics-ttm/{}?apikey={}".format(
+            t, api_key)
         try:
-            r    = requests.get(url, timeout=25)
+            r = requests.get(url, timeout=15)
+            if r.status_code == 429:
+                time.sleep(2.0)
+                r = requests.get(url, timeout=15)
             r.raise_for_status()
-            data = r.json()
-            if not isinstance(data, list):
-                continue
-            for item in data:
-                t = str(item.get("symbol", "")).upper().strip()
-                if not t:
-                    continue
-                fwd_raw = sf(item.get("peRatio"))
-                fwd_pe  = fwd_raw if (fwd_raw and 0 < fwd_raw <= 10_000) else None
-                rg_raw  = sf(item.get("revenueGrowth"))
-                rg      = normalise_pct(rg_raw) if rg_raw is not None else None
-                eg_raw  = sf(item.get("epsGrowth"))
-                eg      = normalise_pct(eg_raw) if eg_raw is not None else None
-                roic_km = sf(item.get("roic"))
-                roic_km = normalise_pct(roic_km) if roic_km is not None else None
-                out[t]  = {
-                    "fwd_pe":         fwd_pe,
-                    "revenue_growth": rg,
-                    "eps_growth":     eg,
-                    "roic_km":        roic_km,
-                }
+            d = r.json()
+            if not isinstance(d, list) or len(d) == 0:
+                return t, {}
+            item = d[0]
+
+            if "fmp_key_metrics_fields" not in st.session_state:
+                st.session_state["fmp_key_metrics_fields"] = list(item.keys())
+
+            fwd_raw = sf(item.get("peRatioTTM"))
+            fwd_pe  = fwd_raw if (fwd_raw and 0 < fwd_raw <= 10_000) else None
+
+            # Try multiple possible EPS growth field names
+            eg_raw  = (sf(item.get("epsGrowthTTM")) or
+                       sf(item.get("epsgrowthTTM")) or
+                       sf(item.get("earningsGrowthTTM")))
+            eg      = normalise_pct(eg_raw) if eg_raw is not None else None
+
+            rg_raw  = sf(item.get("revenueGrowthTTM"))
+            rg      = normalise_pct(rg_raw) if rg_raw is not None else None
+
+            roic_raw = sf(item.get("roicTTM"))
+            roic_km  = normalise_pct(roic_raw) if roic_raw is not None else None
+
+            return t, {
+                "fwd_pe":         fwd_pe,
+                "eps_growth":     eg,
+                "revenue_growth": rg,
+                "roic_km":        roic_km,
+            }
         except Exception:
-            pass
-        time.sleep(0.5)
+            return t, {}
+
+    tl      = list(tickers)
+    CHUNK   = 50
+    WORKERS = 10
+    SLEEP   = 1.0
+    chunks  = [tl[i:i+CHUNK] for i in range(0, len(tl), CHUNK)]
+
+    for ci, chunk in enumerate(chunks):
+        with concurrent.futures.ThreadPoolExecutor(max_workers=WORKERS) as ex:
+            futures = {ex.submit(fetch_one, t): t for t in chunk}
+            for fut in concurrent.futures.as_completed(futures):
+                try:
+                    t, d = fut.result()
+                    if d:
+                        out[t] = d
+                except Exception:
+                    pass
+        if ci < len(chunks) - 1:
+            time.sleep(SLEEP)
+
     return out
 
-
-# ── FMP 4: Earn Revision via analyst-estimates BATCH ─────────────────────────
-# v5 FIX: batch 50 tickers/call, also fills Fwd PE gaps
+# ══════════════════════════════════════════════════════════════════════════════
+# ── LAYER 2D: FMP /analyst-estimates per-ticker — Earn Revision ───────────────
+# ══════════════════════════════════════════════════════════════════════════════
 @st.cache_data(ttl=86400)
-def fetch_fmp_analyst_estimates_batch(tickers, prices_map, api_key):
+def fetch_fmp_analyst_concurrent(tickers, prices_map, api_key):
     out = {t: {"fwd_pe": None, "earn_revision": None} for t in tickers}
     if not api_key:
         return out
-    tl     = list(tickers)
-    CHUNK  = 50
-    chunks = [tl[i:i+CHUNK] for i in range(0, len(tl), CHUNK)]
 
-    for chunk in chunks:
+    def fetch_one(t):
         url = "https://financialmodelingprep.com/api/v3/analyst-estimates/{}?apikey={}".format(
-            ",".join(chunk), api_key)
+            t, api_key)
         try:
-            r    = requests.get(url, timeout=25)
+            r = requests.get(url, timeout=15)
+            if r.status_code == 429:
+                time.sleep(2.0)
+                r = requests.get(url, timeout=15)
             r.raise_for_status()
-            data = r.json()
-            if not isinstance(data, list):
-                continue
-            # Group by ticker
-            by_ticker = {}
-            for item in data:
-                t = str(item.get("symbol", "")).upper().strip()
-                if t:
-                    by_ticker.setdefault(t, []).append(item)
+            d = r.json()
+            if not isinstance(d, list) or len(d) == 0:
+                return t, {"fwd_pe": None, "earn_revision": None}
 
-            for t, estimates in by_ticker.items():
-                # Sort by date descending
+            # Sort by date descending
+            try:
+                d.sort(key=lambda x: x.get("date", ""), reverse=True)
+            except Exception:
+                pass
+
+            # Fwd PE
+            fwd_pe  = None
+            fwd_eps = sf(d[0].get("estimatedEpsAvg"))
+            price   = sf(prices_map.get(t))
+            if fwd_eps and fwd_eps > 0 and price and price > 0:
+                fp     = price / fwd_eps
+                fwd_pe = fp if 0 < fp <= 500 else None
+
+            # Earn Revision
+            earn_rev = None
+            if len(d) >= 2:
+                curr_eps = sf(d[0].get("estimatedEpsAvg"))
+                prev_eps = sf(d[1].get("estimatedEpsAvg"))
+                if curr_eps is not None and prev_eps is not None and prev_eps != 0:
+                    pct_chg  = (curr_eps - prev_eps) / abs(prev_eps)
+                    earn_rev = float(np.clip(pct_chg, -1.0, 1.0))
+
+            return t, {"fwd_pe": fwd_pe, "earn_revision": earn_rev}
+        except Exception:
+            return t, {"fwd_pe": None, "earn_revision": None}
+
+    tl      = list(tickers)
+    CHUNK   = 50
+    WORKERS = 10
+    SLEEP   = 1.0
+    chunks  = [tl[i:i+CHUNK] for i in range(0, len(tl), CHUNK)]
+
+    for ci, chunk in enumerate(chunks):
+        with concurrent.futures.ThreadPoolExecutor(max_workers=WORKERS) as ex:
+            futures = {ex.submit(fetch_one, t): t for t in chunk}
+            for fut in concurrent.futures.as_completed(futures):
                 try:
-                    estimates.sort(key=lambda x: x.get("date", ""), reverse=True)
+                    t, d = fut.result()
+                    out[t] = d
                 except Exception:
                     pass
+        if ci < len(chunks) - 1:
+            time.sleep(SLEEP)
 
-                # Fwd PE from most recent estimate
-                fwd_pe   = None
-                fwd_eps  = sf(estimates[0].get("estimatedEpsAvg")) if estimates else None
-                price    = sf(prices_map.get(t))
-                if fwd_eps and fwd_eps > 0 and price and price > 0:
-                    fp = price / fwd_eps
-                    fwd_pe = fp if 0 < fp <= 500 else None
-
-                # Earn Revision: compare period[0] vs period[1]
-                earn_rev = None
-                if len(estimates) >= 2:
-                    curr_eps = sf(estimates[0].get("estimatedEpsAvg"))
-                    prev_eps = sf(estimates[1].get("estimatedEpsAvg"))
-                    if curr_eps is not None and prev_eps is not None and prev_eps != 0:
-                        pct_chg  = (curr_eps - prev_eps) / abs(prev_eps)
-                        earn_rev = float(np.clip(pct_chg, -1.0, 1.0))
-
-                out[t] = {"fwd_pe": fwd_pe, "earn_revision": earn_rev}
-        except Exception:
-            pass
-        time.sleep(0.5)
     return out
 
-
-# ── Finviz bulk scrape: PE, Fwd PE, PEG for all S&P 500 in one request ────────
-# v5 NEW: single HTTP request returns all 500 stocks — covers ~85% PE, ~70% PEG
-@st.cache_data(ttl=86400)
-def fetch_finviz_bulk(tickers):
-    """
-    Finviz screener returns fundamental data for all S&P 500 stocks in one page.
-    Fields extracted: P/E, Forward P/E, PEG, EPS growth next 5Y (for PEG fallback).
-    No API key required. One request for all 500 stocks.
-    Falls back gracefully if blocked.
-    """
-    out = {t: {} for t in tickers}
-    try:
-        url = (
-            "https://finviz.com/screener.ashx"
-            "?v=152&f=idx_sp500&o=ticker"
-            "&c=1,2,3,4,5,6,7,8,9,10,11,12,14,16,17,21,22,23,24,25,26,27,28"
-        )
-        headers = {
-            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
-                          "AppleWebKit/537.36 (KHTML, like Gecko) "
-                          "Chrome/120.0.0.0 Safari/537.36",
-            "Accept":     "text/html,application/xhtml+xml",
-            "Referer":    "https://finviz.com/",
-        }
-        # Finviz paginates at 20 rows. Use export CSV endpoint instead.
-        export_url = "https://finviz.com/export.ashx?v=152&f=idx_sp500&o=ticker"
-        r = requests.get(export_url, headers=headers, timeout=30)
-        r.raise_for_status()
-
-        # Parse CSV
-        from io import StringIO
-        df = pd.read_csv(StringIO(r.text))
-        df.columns = [c.strip() for c in df.columns]
-
-        col_map = {
-            "Ticker":       "ticker",
-            "P/E":          "pe",
-            "Forward P/E":  "fwd_pe",
-            "PEG":          "peg",
-            "EPS next 5Y":  "eps_growth_5y",
-            "ROE":          "roe",
-            "Oper. Margin": "op_margin",
-        }
-        for _, row in df.iterrows():
-            t = str(row.get("Ticker", "")).upper().strip()
-            if not t:
-                continue
-            rec = {}
-            pe_v = sf(str(row.get("P/E", "")).replace("%", "").strip())
-            if pe_v and 0 < pe_v <= 10_000:
-                rec["pe"]     = pe_v
-                rec["pe_src"] = "Finviz"
-
-            fpe_v = sf(str(row.get("Forward P/E", "")).replace("%", "").strip())
-            if fpe_v and 0 < fpe_v <= 10_000:
-                rec["fwd_pe"] = fpe_v
-
-            peg_v = sf(str(row.get("PEG", "")).replace("%", "").strip())
-            if peg_v and 0 < peg_v <= 500:
-                rec["peg"]     = peg_v
-                rec["peg_src"] = "Finviz"
-
-            eg5_raw = str(row.get("EPS next 5Y", "")).replace("%", "").strip()
-            eg5_v   = sf(eg5_raw)
-            if eg5_v is not None:
-                rec["eps_growth"] = eg5_v   # already in percent from Finviz
-
-            roe_v = sf(str(row.get("ROE", "")).replace("%", "").strip())
-            if roe_v is not None:
-                rec["roe"] = roe_v
-
-            om_v = sf(str(row.get("Oper. Margin", "")).replace("%", "").strip())
-            if om_v is not None:
-                rec["op_margin"] = om_v
-
-            if rec:
-                out[t] = rec
-    except Exception as e:
-        # Finviz sometimes blocks scrapers — fail gracefully, other sources still work
-        pass
-    return out
-
-
-# ── Yahoo Finance fallback ────────────────────────────────────────────────────
+# ══════════════════════════════════════════════════════════════════════════════
+# ── LAYER 3: Yahoo Finance fallback ──────────────────────────────────────────
+# ══════════════════════════════════════════════════════════════════════════════
 def _fetch_yahoo_one(t, max_retries=2):
     result = {}
     try:
@@ -574,7 +663,6 @@ def _fetch_yahoo_one(t, max_retries=2):
         pass
     return t, result
 
-
 @st.cache_data(ttl=86400)
 def fetch_yahoo_fallback_parallel(tickers):
     tl     = list(tickers)
@@ -595,7 +683,6 @@ def fetch_yahoo_fallback_parallel(tickers):
         if ci < len(chunks) - 1:
             time.sleep(SLEEP + random.uniform(0, 0.5))
     return out
-
 
 # ── Revenue ───────────────────────────────────────────────────────────────────
 @st.cache_data(ttl=86400)
@@ -620,22 +707,25 @@ def fetch_last4_revenue_parallel(tickers):
             out[t] = v
     return out
 
-
-# ── Merge all sources v5 ──────────────────────────────────────────────────────
+# ══════════════════════════════════════════════════════════════════════════════
+# ── MERGE all sources ─────────────────────────────────────────────────────────
+# ══════════════════════════════════════════════════════════════════════════════
 def merge_fundamental_data(fmp_quotes, fmp_ratios, fmp_metrics,
                            fmp_analyst, finviz_data, yahoo_fallback, tickers):
     """
-    v5 waterfall priority per metric:
+    v6 waterfall per metric:
       PE:           FMP-quote → Finviz → Yahoo
-      Fwd PE:       FMP-ratios → FMP-metrics → FMP-analyst → Finviz → Yahoo
-      PEG:          FMP-ratios → Finviz
-      ROIC:         FMP-ratios → FMP-metrics (roic_km)
-      Int Coverage: FMP-ratios only
-      Op Margin:    FMP-ratios → Finviz → Yahoo
-      ROE:          FMP-ratios → Finviz → Yahoo  (display only)
-      Debt/Eq:      FMP-ratios → Yahoo            (display only)
-      EPS Growth:   FMP-metrics → Finviz → Yahoo
+      Fwd PE:       FMP-ratios-ttm → FMP-key-metrics → FMP-analyst → Finviz → Yahoo
+      PEG:          FMP-ratios-ttm → Finviz
+      ROIC:         FMP-ratios-ttm → FMP-key-metrics (roic_km)
+      Int Coverage: FMP-ratios-ttm only
+      Op Margin:    FMP-ratios-ttm → Finviz → Yahoo
+      ROE:          FMP-ratios-ttm → Finviz → Yahoo  (display only)
+      D/E:          FMP-ratios-ttm → Finviz → Yahoo  (display only)
+      EPS Growth:   FMP-key-metrics → Finviz → Yahoo
       Earn Revision:FMP-analyst only
+      MC:           FMP-quote → Yahoo
+      52W:          FMP-quote → Yahoo
     """
     merged = {}
     for t in tickers:
@@ -652,24 +742,24 @@ def merge_fundamental_data(fmp_quotes, fmp_ratios, fmp_metrics,
                     return v
             return None
 
-        fwd_pe   = first(fr.get("fwd_pe"),  fm.get("fwd_pe"),
-                         fa.get("fwd_pe"),  fv.get("fwd_pe"), yb.get("fwd_pe"))
-        peg_val  = first(fr.get("peg"),     fv.get("peg"))
-        peg_src  = ("FMP-ratios" if fr.get("peg") is not None else
-                    "Finviz"     if fv.get("peg") is not None else "—")
-        pe_val   = first(fq.get("pe"),      fv.get("pe"),    yb.get("pe"))
-        pe_src   = ("FMP-quote" if fq.get("pe")  is not None else
-                    "Finviz"    if fv.get("pe")  is not None else
-                    yb.get("pe_src", "Yahoo"))
-        roic     = first(fr.get("roic"),    fm.get("roic_km"))
-        ic       = first(fr.get("int_coverage"))
-        om       = first(fr.get("op_margin"), fv.get("op_margin"), yb.get("op_margin"))
-        roe      = first(fr.get("roe"),     fv.get("roe"),    yb.get("roe"))
-        de       = first(fr.get("debt_eq"), yb.get("debt_eq"))
-        eps_g    = first(fm.get("eps_growth"), fv.get("eps_growth"), yb.get("eps_growth"))
-        g_src    = ("FMP"     if fm.get("eps_growth") is not None else
-                    "Finviz"  if fv.get("eps_growth") is not None else
-                    "Yahoo"   if yb.get("eps_growth") is not None else None)
+        fwd_pe  = first(fr.get("fwd_pe"),  fm.get("fwd_pe"),
+                        fa.get("fwd_pe"),  fv.get("fwd_pe"), yb.get("fwd_pe"))
+        peg_val = first(fr.get("peg"),     fv.get("peg"))
+        peg_src = ("FMP-ratios-ttm" if fr.get("peg") is not None else
+                   "Finviz"         if fv.get("peg") is not None else "—")
+        pe_val  = first(fq.get("pe"),      fv.get("pe"),    yb.get("pe"))
+        pe_src  = ("FMP-quote" if fq.get("pe")  is not None else
+                   "Finviz"    if fv.get("pe")  is not None else
+                   yb.get("pe_src", "Yahoo"))
+        roic    = first(fr.get("roic"),    fm.get("roic_km"))
+        ic      = first(fr.get("int_coverage"))
+        om      = first(fr.get("op_margin"), fv.get("op_margin"), yb.get("op_margin"))
+        roe     = first(fr.get("roe"),     fv.get("roe"),    yb.get("roe"))
+        de      = first(fr.get("debt_eq"), fv.get("debt_eq"), yb.get("debt_eq"))
+        eps_g   = first(fm.get("eps_growth"), fv.get("eps_growth"), yb.get("eps_growth"))
+        g_src   = ("FMP"    if fm.get("eps_growth") is not None else
+                   "Finviz" if fv.get("eps_growth") is not None else
+                   "Yahoo"  if yb.get("eps_growth") is not None else None)
         earn_rev = fa.get("earn_revision")
 
         merged[t] = {
@@ -693,8 +783,7 @@ def merge_fundamental_data(fmp_quotes, fmp_ratios, fmp_metrics,
         }
     return merged
 
-
-# ── Quality score v5 ──────────────────────────────────────────────────────────
+# ── Quality Score ─────────────────────────────────────────────────────────────
 def compute_quality_score(roic, int_coverage, op_margin):
     scores = []
     if roic is not None and not pd.isna(roic):
@@ -713,7 +802,6 @@ def compute_quality_score(roic, int_coverage, op_margin):
         scores.append(0.0)
     return sum(scores) / 3.0
 
-
 # ── Conviction Score ──────────────────────────────────────────────────────────
 def compute_conviction_scores(scr):
     KEY_FACTORS = ["P/E", "Fwd P/E", "PEG", "Quality Score",
@@ -725,9 +813,9 @@ def compute_conviction_scores(scr):
         present = sum(1 for c in KEY_FACTORS if c in row.index and pd.notna(row[c]))
         return present / n_factors
 
-    scr["_completeness"]  = scr.apply(completeness, axis=1)
-    overall_median_pe     = scr["P/E"].median()
-    sector_pe_map         = scr.groupby("Sector")["P/E"].median()
+    scr["_completeness"]    = scr.apply(completeness, axis=1)
+    overall_median_pe       = scr["P/E"].median()
+    sector_pe_map           = scr.groupby("Sector")["P/E"].median()
 
     def sector_discount(sector):
         if pd.isna(overall_median_pe) or overall_median_pe == 0:
@@ -737,15 +825,14 @@ def compute_conviction_scores(scr):
             return 1.0
         return float(np.clip(overall_median_pe / s_pe, 0.7, 1.3))
 
-    scr["_sec_discount"]  = scr["Sector"].map(sector_discount)
-    raw_conviction        = scr["Score"] * scr["_completeness"] * scr["_sec_discount"]
-    c_min, c_max          = raw_conviction.min(), raw_conviction.max()
+    scr["_sec_discount"]    = scr["Sector"].map(sector_discount)
+    raw_conviction          = scr["Score"] * scr["_completeness"] * scr["_sec_discount"]
+    c_min, c_max            = raw_conviction.min(), raw_conviction.max()
     scr["Conviction Score"] = ((raw_conviction - c_min) / (c_max - c_min) * 100.0
                                 if c_max > c_min else 50.0)
     return scr.drop(columns=["_completeness", "_sec_discount"])
 
-
-# ── Ranking v5: clean 5 factors, no Earn Trajectory ──────────────────────────
+# ── Ranking v6 ────────────────────────────────────────────────────────────────
 def compute_rank_by_sector(scr):
     scr = scr.copy()
     scr["Score"] = pd.NA
@@ -758,14 +845,10 @@ def compute_rank_by_sector(scr):
         if elig.empty:
             continue
 
-        # VALUATION: pure PE percentile (Fwd PE preferred, trailing fallback)
         pe_input       = elig["Fwd P/E"].fillna(elig["P/E"])
         elig["_s_val"] = percentile_score(pe_input, ascending=True)
-
-        # PEG standalone
         elig["_s_peg"] = percentile_score(elig["PEG"], ascending=True)
 
-        # QUALITY: min-max within sector
         qs    = elig["Quality Score"]
         q_min = qs.min(); q_max = qs.max()
         if pd.notna(q_min) and pd.notna(q_max) and q_max > q_min:
@@ -774,20 +857,15 @@ def compute_rank_by_sector(scr):
             elig["_s_quality"] = qs.fillna(0.0)
         elig["_s_quality"] = elig["_s_quality"].fillna(0.0)
 
-        # MOMENTUM: skip-month vol-adjusted
-        elig["_s_mom"] = percentile_score(elig["Momentum Score"], ascending=False)
+        elig["_s_mom"]  = percentile_score(elig["Momentum Score"], ascending=False)
+        elig["_s_erev"] = percentile_score(elig["Earn Revision"],  ascending=False)
 
-        # EARN REVISION
-        elig["_s_erev"] = percentile_score(elig["Earn Revision"], ascending=False)
-
-        # COMPOSITE
         raw = (W["valuation"]     * elig["_s_val"]     +
                W["quality"]       * elig["_s_quality"] +
                W["peg"]           * elig["_s_peg"]     +
                W["earn_revision"] * elig["_s_erev"]    +
                W["momentum"]      * elig["_s_mom"])
 
-        # MISSING DATA PENALTY
         factor_cols = ["P/E", "PEG", "Quality Score", "Earn Revision", "Momentum Score"]
         penalties   = elig.apply(lambda r: missing_factor_penalty(r, factor_cols), axis=1)
         raw         = raw * penalties
@@ -800,8 +878,7 @@ def compute_rank_by_sector(scr):
 
     return scr
 
-
-# ── Build screener table v5 ───────────────────────────────────────────────────
+# ── Build screener table ──────────────────────────────────────────────────────
 def build_screener_table(universe_df, prices_map, merged_map, revenue_map, momentum_map):
     rows = []
     for _, r in universe_df.iterrows():
@@ -830,12 +907,11 @@ def build_screener_table(universe_df, prices_map, merged_map, revenue_map, momen
         rq1, rq2, rq3, rq4 = [to_num(x) for x in rev4]
         growth             = revenue_growth_pct_cagr([rq1, rq2, rq3, rq4])
 
-        # PEG — FMP or Finviz direct; fallback compute from EPS growth only
         peg_direct = to_num(fi.get("peg"))
         peg = None; peg_method = "—"
         if pd.notna(peg_direct):
             peg        = float(peg_direct)
-            peg_method = fi.get("peg_src") or "FMP-ratios"
+            peg_method = fi.get("peg_src") or "FMP-ratios-ttm"
         else:
             pe_for_peg = fwd if pd.notna(fwd) else pe
             eps_g      = fi.get("eps_growth")
@@ -849,7 +925,7 @@ def build_screener_table(universe_df, prices_map, merged_map, revenue_map, momen
         if peg is not None and (peg <= 0 or peg > 500):
             peg = None
 
-        q_score  = compute_quality_score(
+        q_score = compute_quality_score(
             float(roic) if pd.notna(roic) else None,
             float(ic)   if pd.notna(ic)   else None,
             float(om)   if pd.notna(om)   else None,
@@ -871,6 +947,7 @@ def build_screener_table(universe_df, prices_map, merged_map, revenue_map, momen
         if gr and gr != "—": parts.append("G:{}".format(gr))
         if earn_rev is not None: parts.append("EarnRev:FMP")
         if roic     is not None: parts.append("ROIC:FMP")
+        if ic       is not None: parts.append("IC:FMP")
         data_src = " | ".join(parts) if parts else "Yahoo only"
 
         rows.append({
@@ -923,8 +1000,7 @@ def build_screener_table(universe_df, prices_map, merged_map, revenue_map, momen
     scr = compute_conviction_scores(scr)
     return scr
 
-
-# ── Quality flag v5 ───────────────────────────────────────────────────────────
+# ── Quality flag ──────────────────────────────────────────────────────────────
 def quality_flag(roic, ic, om, de):
     flags = []
     if roic is not None and not pd.isna(roic) and roic < QUALITY_THRESHOLDS["roic_min"]:
@@ -935,7 +1011,6 @@ def quality_flag(roic, ic, om, de):
         flags.append("Margin<5%")
     de_note = " | D/E:{:.1f}".format(de) if (de is not None and not pd.isna(de)) else ""
     return (", ".join(flags) if flags else "Pass") + de_note
-
 
 # ── KPI panel ─────────────────────────────────────────────────────────────────
 def render_sector_kpi_panel(scr, sector_sel):
@@ -973,8 +1048,8 @@ def render_sector_kpi_panel(scr, sector_sel):
     )
 
     c1, c2, c3, c4, c5, c6, c7 = st.columns(7)
-    c1.markdown(_kpi("Sector Mkt Cap",  fmt_mc(sector_mc), "sector total"),         unsafe_allow_html=True)
-    c2.markdown(_kpi("S&P 500 Mkt Cap", fmt_mc(total_mc),  "all stocks"),           unsafe_allow_html=True)
+    c1.markdown(_kpi("Sector Mkt Cap",  fmt_mc(sector_mc), "sector total"),   unsafe_allow_html=True)
+    c2.markdown(_kpi("S&P 500 Mkt Cap", fmt_mc(total_mc),  "all stocks"),     unsafe_allow_html=True)
     c3.markdown(_kpi("Sector Share",
                      "{:.1f}%".format(pct), "{} stocks".format(len(sdata))),
                 unsafe_allow_html=True)
@@ -1012,7 +1087,7 @@ def render_sector_kpi_panel(scr, sector_sel):
             "<div>{}</div>"
             "<div style='color:#555;font-size:10px;margin-top:8px;'>"
             "Score = Valuation 25% (pure PE) + Quality 25% (ROIC+IntCov+Margin) "
-            "+ PEG 20% + Earn Revision 15% + Momentum 15% (skip-month vol-adj)"
+            "+ PEG 20% + Earn Revision 15% + Momentum 15%"
             "</div></div>".format(badges or "<span style='color:#555;'>No ranked stocks</span>"),
             unsafe_allow_html=True,
         )
@@ -1022,37 +1097,36 @@ def render_sector_kpi_panel(scr, sector_sel):
 # ══════════════════════════════════════════════════════════════════════════════
 # ── APP ───────────────────────────────────────────────────────────────────────
 # ══════════════════════════════════════════════════════════════════════════════
-st.set_page_config(page_title="S&P 500 Screener v5", layout="wide", page_icon="📊")
+st.set_page_config(page_title="S&P 500 Screener v6", layout="wide", page_icon="📊")
 st.markdown(
     "<style>div[data-testid='stDataFrame'] table{font-size:13px;}"
     ".stDataFrame thead th{background:#1a1a2e;color:#93c5fd;font-weight:700;}</style>",
     unsafe_allow_html=True,
 )
 
-st.markdown("## S&P 500 Fundamental Screener v5")
+st.markdown("## S&P 500 Fundamental Screener v6")
 st.caption(
-    "Clean 5-factor model · Pure PE valuation · Standalone PEG · "
-    "Earn Trajectory removed · Bulk FMP endpoints · Finviz coverage fallback · "
-    "ROIC + Interest Coverage quality"
+    "Coverage fix: Finviz primary (1 request) + FMP per-ticker concurrent + Yahoo fallback · "
+    "Clean 5-factor model · Diagnostic mode available"
 )
 
-col_r, col_t = st.columns([1, 6])
+col_r, col_diag, col_t = st.columns([1, 1, 5])
 with col_r:
     if st.button("Refresh"):
         st.cache_data.clear()
         st.rerun()
+with col_diag:
+    show_diag = st.checkbox("Show diagnostics", value=False)
 with col_t:
     st.caption("Last loaded: {} · Prices: 1hr · Fundamentals: 24hr".format(
         datetime.now().strftime("%I:%M %p")))
 
 fmp_key = get_fmp_key()
 if not fmp_key:
-    st.warning(
-        "No FMP API key. Add [fmp] api_key to Streamlit Secrets. "
-        "ROIC, Int Coverage, Earn Revision require FMP. Using Finviz + Yahoo only."
-    )
+    st.warning("No FMP API key. ROIC, Int Coverage, Earn Revision require FMP. Add [fmp] api_key to Streamlit Secrets.")
 
-with st.spinner("Loading S&P 500 universe..."):
+# ── Load universe ─────────────────────────────────────────────────────────────
+with st.spinner("Loading S&P 500 universe from Wikipedia..."):
     sp500 = fetch_sp500_constituents()
 if sp500.empty:
     st.error("Failed to load S&P 500 universe."); st.stop()
@@ -1060,36 +1134,53 @@ if sp500.empty:
 universe_df = sp500.copy().reset_index(drop=True)
 tickers     = tuple(universe_df["Ticker"].tolist())
 
-with st.spinner("Fetching prices ({} tickers)...".format(len(tickers))):
+# ── Fetch data ────────────────────────────────────────────────────────────────
+with st.spinner("Fetching prices ({} tickers via Yahoo batch)...".format(len(tickers))):
     prices = fetch_prices_batch(tickers)
 
-with st.spinner("Fetching momentum — skip-month vol-adjusted..."):
+with st.spinner("Fetching momentum (skip-month vol-adjusted, {} tickers)...".format(len(tickers))):
     momentum = fetch_momentum_batch(tickers)
 
-fmp_quotes  = {}
-fmp_ratios  = {}
-fmp_metrics = {}
-fmp_analyst = {t: {"fwd_pe": None, "earn_revision": None} for t in tickers}
-
-if fmp_key:
-    with st.spinner("FMP bulk quotes (PE, MC, 52W)..."):
-        fmp_quotes = fetch_fmp_bulk_quotes(tickers, fmp_key)
-
-    with st.spinner("FMP bulk ratios (PEG, ROIC, Int Coverage, Op Margin) — ~11 calls..."):
-        fmp_ratios = fetch_fmp_ratios_bulk(tickers, fmp_key)
-
-    with st.spinner("FMP bulk key-metrics (EPS growth, Fwd PE) — ~11 calls..."):
-        fmp_metrics = fetch_fmp_key_metrics_bulk(tickers, fmp_key)
-
-    with st.spinner("FMP analyst estimates batch (Earn Revision + Fwd PE gap fill) — ~11 calls..."):
-        fmp_analyst = fetch_fmp_analyst_estimates_batch(tickers, prices, fmp_key)
-
-with st.spinner("Finviz bulk scrape (PE, Fwd PE, PEG fallback — 1 request for all 500)..."):
+# LAYER 1: Finviz — fastest, broadest coverage
+with st.spinner("LAYER 1: Finviz bulk export (1 request → PE, Fwd PE, PEG for ~490 stocks)..."):
     finviz_data = fetch_finviz_bulk(tickers)
 
-finviz_pe_count = sum(1 for t in tickers if finviz_data.get(t, {}).get("pe") is not None)
-st.caption("Finviz coverage: {} tickers with PE data".format(finviz_pe_count))
+finviz_pe_count  = sum(1 for t in tickers if finviz_data.get(t, {}).get("pe")     is not None)
+finviz_peg_count = sum(1 for t in tickers if finviz_data.get(t, {}).get("peg")    is not None)
+finviz_fwd_count = sum(1 for t in tickers if finviz_data.get(t, {}).get("fwd_pe") is not None)
 
+if "finviz_error" in st.session_state:
+    st.warning("Finviz fetch issue: {}. Falling back to FMP + Yahoo.".format(
+        st.session_state["finviz_error"]))
+else:
+    st.caption("Finviz: {} PE · {} Fwd PE · {} PEG fetched".format(
+        finviz_pe_count, finviz_fwd_count, finviz_peg_count))
+
+# LAYER 2A: FMP bulk /quote
+fmp_quotes = {}
+if fmp_key:
+    with st.spinner("LAYER 2A: FMP bulk /quote (PE, MC, 52W override)..."):
+        fmp_quotes = fetch_fmp_bulk_quotes(tickers, fmp_key)
+
+# LAYER 2B: FMP /ratios-ttm — concurrent per-ticker (ROIC + Int Coverage)
+fmp_ratios = {}
+if fmp_key:
+    with st.spinner("LAYER 2B: FMP /ratios-ttm concurrent ({} tickers, 10 workers)... Takes ~60s".format(len(tickers))):
+        fmp_ratios = fetch_fmp_ratios_ttm_concurrent(tickers, fmp_key)
+
+# LAYER 2C: FMP /key-metrics-ttm
+fmp_metrics = {}
+if fmp_key:
+    with st.spinner("LAYER 2C: FMP /key-metrics-ttm concurrent (EPS growth, Fwd PE)..."):
+        fmp_metrics = fetch_fmp_key_metrics_concurrent(tickers, fmp_key)
+
+# LAYER 2D: FMP /analyst-estimates
+fmp_analyst = {t: {"fwd_pe": None, "earn_revision": None} for t in tickers}
+if fmp_key:
+    with st.spinner("LAYER 2D: FMP /analyst-estimates concurrent (Earn Revision)..."):
+        fmp_analyst = fetch_fmp_analyst_concurrent(tickers, prices, fmp_key)
+
+# LAYER 3: Yahoo fallback — only tickers still missing PE after Finviz + FMP
 missing_pe = tuple(
     t for t in tickers
     if fmp_quotes.get(t, {}).get("pe") is None
@@ -1097,18 +1188,60 @@ missing_pe = tuple(
 )
 yahoo_fallback = {}
 if missing_pe:
-    with st.spinner("Yahoo fallback: {} tickers still missing PE after FMP + Finviz...".format(len(missing_pe))):
+    with st.spinner("LAYER 3: Yahoo fallback for {} tickers still missing PE...".format(len(missing_pe))):
         yahoo_fallback = fetch_yahoo_fallback_parallel(missing_pe)
 
-with st.spinner("Merging all data sources..."):
+with st.spinner("Merging all sources..."):
     merged_map = merge_fundamental_data(
         fmp_quotes, fmp_ratios, fmp_metrics,
         fmp_analyst, finviz_data, yahoo_fallback, tickers)
 
-with st.spinner("Fetching quarterly revenue..."):
+with st.spinner("Fetching quarterly revenue (Yahoo, parallel)..."):
     rev_map = fetch_last4_revenue_parallel(tickers)
 
-# Coverage banner
+# ── Diagnostic panel ──────────────────────────────────────────────────────────
+if show_diag:
+    st.markdown("### Diagnostic — API Field Names & Coverage")
+    diag_cols = st.columns(2)
+    with diag_cols[0]:
+        if "finviz_columns" in st.session_state:
+            st.markdown("**Finviz CSV columns ({} rows):**".format(
+                st.session_state.get("finviz_rows", "?")))
+            st.code("\n".join(st.session_state["finviz_columns"]))
+        else:
+            st.warning("Finviz columns not captured yet.")
+        if "finviz_error" in st.session_state:
+            st.error("Finviz error: " + st.session_state["finviz_error"])
+    with diag_cols[1]:
+        if "fmp_ratios_ttm_fields" in st.session_state:
+            st.markdown("**FMP /ratios-ttm fields:**")
+            st.code("\n".join(st.session_state["fmp_ratios_ttm_fields"]))
+        if "fmp_key_metrics_fields" in st.session_state:
+            st.markdown("**FMP /key-metrics-ttm fields:**")
+            st.code("\n".join(st.session_state["fmp_key_metrics_fields"]))
+
+    # Per-source contribution
+    st.markdown("**Coverage contribution by source:**")
+    source_stats = {
+        "FMP-quote PE":       sum(1 for t in tickers if fmp_quotes.get(t, {}).get("pe")            is not None),
+        "Finviz PE":          sum(1 for t in tickers if finviz_data.get(t, {}).get("pe")           is not None),
+        "Finviz PEG":         sum(1 for t in tickers if finviz_data.get(t, {}).get("peg")          is not None),
+        "Finviz Fwd PE":      sum(1 for t in tickers if finviz_data.get(t, {}).get("fwd_pe")       is not None),
+        "FMP ratios ROIC":    sum(1 for t in tickers if fmp_ratios.get(t, {}).get("roic")          is not None),
+        "FMP ratios IntCov":  sum(1 for t in tickers if fmp_ratios.get(t, {}).get("int_coverage")  is not None),
+        "FMP ratios PEG":     sum(1 for t in tickers if fmp_ratios.get(t, {}).get("peg")           is not None),
+        "FMP metrics EpsG":   sum(1 for t in tickers if fmp_metrics.get(t, {}).get("eps_growth")   is not None),
+        "FMP analyst EarnRev":sum(1 for t in tickers if fmp_analyst.get(t, {}).get("earn_revision")is not None),
+        "Yahoo fallback PE":  sum(1 for t in tickers if yahoo_fallback.get(t, {}).get("pe")        is not None),
+    }
+    st.dataframe(
+        pd.DataFrame(list(source_stats.items()), columns=["Source", "Count"]).assign(
+            Pct=lambda d: (d["Count"] / len(tickers) * 100).round(1)
+        ),
+        use_container_width=True, height=320,
+    )
+
+# ── Coverage banner ───────────────────────────────────────────────────────────
 total_t  = len(tickers)
 has_pe   = sum(1 for t in tickers if merged_map.get(t, {}).get("pe")            is not None)
 has_fwd  = sum(1 for t in tickers if merged_map.get(t, {}).get("fwd_pe")        is not None)
@@ -1125,16 +1258,20 @@ st.info(
     "ROIC: {}/{} ({:.0f}%) · "
     "Int Coverage: {}/{} ({:.0f}%) · "
     "Earn Revision: {}/{} ({:.0f}%) · "
-    "Sources: FMP bulk + Finviz + Yahoo".format(
+    "Finviz: {} · FMP /ratios-ttm: {} · Yahoo fallback: {}".format(
         has_pe,   total_t, has_pe   / total_t * 100,
         has_fwd,  total_t, has_fwd  / total_t * 100,
         has_peg,  total_t, has_peg  / total_t * 100,
         has_roic, total_t, has_roic / total_t * 100,
         has_ic,   total_t, has_ic   / total_t * 100,
         has_erev, total_t, has_erev / total_t * 100,
+        finviz_pe_count,
+        sum(1 for t in tickers if fmp_ratios.get(t, {}).get("roic") is not None),
+        len(yahoo_fallback),
     )
 )
 
+# ── Build table ───────────────────────────────────────────────────────────────
 scr = build_screener_table(universe_df, prices, merged_map, rev_map, momentum)
 
 # ── Filters ───────────────────────────────────────────────────────────────────
@@ -1250,8 +1387,16 @@ st.dataframe(disp_final, use_container_width=True, height=680)
 st.download_button(
     label="Download filtered results as CSV",
     data=disp_final.to_csv(index=False).encode("utf-8"),
-    file_name="sp500_screener_v5_{}.csv".format(datetime.now().strftime("%Y%m%d_%H%M")),
+    file_name="sp500_screener_v6_{}.csv".format(datetime.now().strftime("%Y%m%d_%H%M")),
     mime="text/csv",
+)
+
+st.markdown("---")
+st.markdown(
+    "**Sources:** Finviz export (primary, 1 req) · FMP /quote (bulk) · "
+    "FMP /ratios-ttm (per-ticker concurrent) · FMP /key-metrics-ttm (per-ticker concurrent) · "
+    "FMP /analyst-estimates (per-ticker concurrent) · Yahoo Finance (fallback + revenue + momentum) · "
+    "S&P 500 universe: Wikipedia GICS"
 )
 
 

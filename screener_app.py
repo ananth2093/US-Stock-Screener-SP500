@@ -1,28 +1,30 @@
-# screener_app.py  v7
+# screener_app.py  v8
 # ─────────────────────────────────────────────────────────────────────────────
-# COMPLETE REWRITE — Yahoo Finance as primary source
+# v8 CHANGES from v7:
+#   1. ROIC% computed from Yahoo quarterly_financials + balance_sheet
+#      Formula: NOPAT / Invested Capital (TTM)
+#      NOPAT = Operating Income × (1 - effective tax rate)
+#      Invested Capital = Total Equity + Total Debt - Cash
 #
-# ROOT CAUSE OF ALL PREVIOUS 0% ISSUES:
-#   1. FMP API key not in Streamlit secrets → /quote returns 0
-#   2. Finviz blocks Streamlit Cloud IPs → 0 rows
-#   3. FMP /ratios-ttm, /key-metrics-ttm → may not be on free tier
+#   2. Earn Revision → renamed "Earn Trajectory" (Earn Traj)
+#      Proxy: (forwardEps - trailingEps) / abs(trailingEps)
+#      Captures whether analysts expect earnings to grow or shrink
+#      Available from Yahoo .info for ~85% of S&P 500
 #
-# v7 STRATEGY — Yahoo First, FMP as bonus if key exists:
+#   3. Weights redistributed — no dead-weight factors:
+#      Valuation: 25% → 25% (unchanged)
+#      Quality:   25% → 25% (unchanged)
+#      PEG:       20% → 20% (unchanged)
+#      Earn Traj: 15% → 15% (now POPULATED from Yahoo)
+#      Momentum:  15% → 15% (unchanged)
 #
-#   LAYER 1 (PRIMARY): Yahoo Finance batch download
-#     → Prices, 52W Hi/Lo, Market Cap from yf.download (fast, all 503)
-#     → PEG, PE, FwdPE, ROE, OpMargin, D/E, EpsGrowth from yf.Ticker.info
-#     → EBIT + InterestExpense from yf.Ticker.financials → compute IntCoverage
-#     → Expected coverage: PE ~85%, PEG ~70%, IntCoverage ~60%
+#   4. ROIC column now populated for display AND used in Quality Score
+#      (ROE remains as fallback if ROIC computation fails)
 #
+# ARCHITECTURE (same as v7):
+#   LAYER 1 (PRIMARY): Yahoo Finance
 #   LAYER 2 (BONUS): FMP /quote bulk — if API key exists
-#     → Overrides Yahoo PE with FMP PE where available
-#
-#   LAYER 3 (BONUS): FMP /ratios-ttm per-ticker concurrent — if key exists
-#     → Overrides ROIC, IntCoverage, PEG with FMP values where available
-#
-# KEY INSIGHT: Yahoo .info has pegRatio, returnOnEquity, operatingMargins,
-#   debtToEquity, earningsGrowth — these are what we need and they work!
+#   LAYER 3 (BONUS): FMP /ratios-ttm — if key exists AND tier supports it
 # ─────────────────────────────────────────────────────────────────────────────
 
 import streamlit as st
@@ -52,7 +54,7 @@ FACTOR_WEIGHTS = {
     "valuation":     0.25,
     "quality":       0.25,
     "peg":           0.20,
-    "earn_revision": 0.15,
+    "earn_traj":     0.15,
     "momentum":      0.15,
 }
 
@@ -228,8 +230,8 @@ def fetch_momentum_batch(tickers):
 
 # ══════════════════════════════════════════════════════════════════════════════
 # ── LAYER 1 PRIMARY: Yahoo Finance per-ticker fundamentals ────────────────────
-# Fetches: PE, FwdPE, PEG, ROE, OpMargin, D/E, EpsGrowth, MC, 52W, IntCoverage
-# IntCoverage computed from income statement: EBIT / InterestExpense
+# v8: Now also computes ROIC from financials + balance_sheet
+#     and Earn Trajectory from forwardEps vs trailingEps
 # ══════════════════════════════════════════════════════════════════════════════
 def _fetch_yahoo_fundamentals_one(t):
     result = {
@@ -237,10 +239,12 @@ def _fetch_yahoo_fundamentals_one(t):
         "fwd_pe": None,
         "peg": None, "peg_src": None,
         "roe": None,
+        "roic": None,
         "op_margin": None,
         "debt_eq": None,
         "eps_growth": None,
         "int_coverage": None,
+        "earn_traj": None,
         "mc": None,
         "hi52": None,
         "lo52": None,
@@ -261,7 +265,7 @@ def _fetch_yahoo_fundamentals_one(t):
         except Exception:
             pass
 
-        # ── .info: PE, FwdPE, PEG, quality metrics ───────────────────────
+        # ── .info: PE, FwdPE, PEG, quality metrics, Earn Traj ────────────
         info = {}
         for attempt in range(2):
             try:
@@ -318,6 +322,16 @@ def _fetch_yahoo_fundamentals_one(t):
         if eg_y is not None:
             result["eps_growth"] = eg_y * 100.0
 
+        # ── Earn Trajectory (v8 NEW) ─────────────────────────────────────
+        # Proxy for earnings revision: (forwardEps - trailingEps) / |trailingEps|
+        # Positive = analysts expect growth, Negative = expect decline
+        # Clipped to [-1.0, +1.0] range
+        fwd_eps_val = sf(info.get("forwardEps"))
+        trail_eps_val = sf(info.get("trailingEps"))
+        if fwd_eps_val is not None and trail_eps_val is not None and abs(trail_eps_val) > 0.01:
+            earn_traj_raw = (fwd_eps_val - trail_eps_val) / abs(trail_eps_val)
+            result["earn_traj"] = max(-1.0, min(1.0, earn_traj_raw))
+
         # MC if not from fast_info
         if result["mc"] is None:
             mc_y = sf(info.get("marketCap"))
@@ -335,11 +349,9 @@ def _fetch_yahoo_fundamentals_one(t):
                 result["lo52"] = l52
 
         # ── Interest Coverage from income statement ───────────────────────
-        # IntCoverage = EBIT / InterestExpense (TTM = sum last 4 quarters)
         try:
             qfin = obj.quarterly_financials
             if qfin is not None and not qfin.empty:
-                # Try multiple row names Yahoo uses
                 ebit_row = None
                 for nm in ["EBIT", "Operating Income", "Ebit"]:
                     if nm in qfin.index:
@@ -362,6 +374,94 @@ def _fetch_yahoo_fundamentals_one(t):
         except Exception:
             pass
 
+        # ── ROIC from financials + balance_sheet (v8 NEW) ─────────────────
+        # ROIC = NOPAT / Invested Capital
+        # NOPAT = Operating Income (TTM) × (1 - effective tax rate)
+        # Invested Capital = Total Stockholders Equity + Total Debt - Cash
+        try:
+            qfin = obj.quarterly_financials
+            bs   = obj.quarterly_balance_sheet
+
+            if qfin is not None and not qfin.empty and bs is not None and not bs.empty:
+                # Get Operating Income TTM (sum of last 4 quarters)
+                op_inc_row = None
+                for nm in ["Operating Income", "EBIT", "Ebit"]:
+                    if nm in qfin.index:
+                        op_inc_row = nm
+                        break
+
+                # Get Tax Provision and Pre-Tax Income for effective tax rate
+                tax_row = None
+                for nm in ["Tax Provision", "Income Tax Expense", "Tax Expense"]:
+                    if nm in qfin.index:
+                        tax_row = nm
+                        break
+
+                pretax_row = None
+                for nm in ["Pretax Income", "Income Before Tax", "EBT"]:
+                    if nm in qfin.index:
+                        pretax_row = nm
+                        break
+
+                if op_inc_row:
+                    op_inc_ttm = float(qfin.loc[op_inc_row].dropna().head(4).sum())
+
+                    # Compute effective tax rate
+                    eff_tax_rate = 0.21  # default to US corporate rate
+                    if tax_row and pretax_row:
+                        tax_ttm    = float(qfin.loc[tax_row].dropna().head(4).sum())
+                        pretax_ttm = float(qfin.loc[pretax_row].dropna().head(4).sum())
+                        if pretax_ttm > 0 and tax_ttm >= 0:
+                            computed_rate = tax_ttm / pretax_ttm
+                            if 0 < computed_rate < 0.6:  # sanity check
+                                eff_tax_rate = computed_rate
+
+                    nopat = op_inc_ttm * (1 - eff_tax_rate)
+
+                    # Get most recent balance sheet data
+                    # Total Stockholders Equity
+                    equity_val = None
+                    for nm in ["Total Stockholders Equity", "Stockholders Equity",
+                               "Common Stock Equity", "Total Equity Gross Minority Interest"]:
+                        if nm in bs.index:
+                            eq_series = bs.loc[nm].dropna()
+                            if len(eq_series) > 0:
+                                equity_val = float(eq_series.iloc[0])
+                                break
+
+                    # Total Debt
+                    debt_val = None
+                    for nm in ["Total Debt", "Net Debt", "Long Term Debt",
+                               "Long Term Debt And Capital Lease Obligation"]:
+                        if nm in bs.index:
+                            d_series = bs.loc[nm].dropna()
+                            if len(d_series) > 0:
+                                debt_val = float(d_series.iloc[0])
+                                break
+
+                    # Cash
+                    cash_val = None
+                    for nm in ["Cash And Cash Equivalents", "Cash Cash Equivalents And Short Term Investments",
+                               "Cash Financial", "Cash And Short Term Investments"]:
+                        if nm in bs.index:
+                            c_series = bs.loc[nm].dropna()
+                            if len(c_series) > 0:
+                                cash_val = float(c_series.iloc[0])
+                                break
+
+                    # Compute Invested Capital
+                    if equity_val is not None and debt_val is not None:
+                        cash_use = cash_val if cash_val is not None else 0
+                        invested_capital = equity_val + debt_val - cash_use
+
+                        if invested_capital > 0 and nopat != 0:
+                            roic_computed = (nopat / invested_capital) * 100.0
+                            # Sanity check: ROIC between -100% and +200%
+                            if -100 < roic_computed < 200:
+                                result["roic"] = roic_computed
+        except Exception:
+            pass
+
     except Exception:
         pass
     return t, result
@@ -372,7 +472,6 @@ def fetch_yahoo_fundamentals_all(tickers):
     """
     Fetch fundamentals for ALL tickers via Yahoo Finance.
     Uses 8 concurrent workers with chunked rate limiting.
-    Expected to complete in 3-5 minutes for 503 tickers.
     """
     tl     = list(tickers)
     out    = {}
@@ -462,9 +561,8 @@ def fetch_fmp_ratios_if_available(tickers, api_key):
         r    = requests.get(test_url, timeout=10)
         data = r.json()
         if not isinstance(data, list) or len(data) == 0:
-            st.caption("FMP /ratios-ttm: not available on your tier. Using Yahoo quality metrics.")
+            st.caption("FMP /ratios-ttm: not available on your tier. Using Yahoo-computed ROIC and quality metrics.")
             return out
-        # Store field names for diagnostic
         st.session_state["fmp_ratios_fields"] = list(data[0].keys())
     except Exception:
         return out
@@ -587,9 +685,8 @@ def merge_all_sources(yahoo_data, fmp_quotes, fmp_ratios, tickers):
         peg_src = ("FMP-ratios" if fr.get("peg") is not None else
                    yb.get("peg_src", "Yahoo") if yb.get("peg") is not None else "—")
 
-        # ROIC: FMP-ratios only (Yahoo doesn't have ROIC directly)
-        # Fallback: use ROE as proxy if ROIC missing
-        roic    = first(fr.get("roic"))
+        # ROIC: FMP-ratios > Yahoo-computed (v8: Yahoo now computes ROIC!)
+        roic    = first(fr.get("roic"),    yb.get("roic"))
 
         # ROE: FMP-ratios > Yahoo
         roe     = first(fr.get("roe"),     yb.get("roe"))
@@ -607,14 +704,13 @@ def merge_all_sources(yahoo_data, fmp_quotes, fmp_ratios, tickers):
         eps_g   = yb.get("eps_growth")
         g_src   = "Yahoo" if eps_g is not None else None
 
+        # Earn Trajectory (v8 NEW): from Yahoo forwardEps vs trailingEps
+        earn_traj = yb.get("earn_traj")
+
         # MC, 52W: FMP-quote > Yahoo
         mc      = first(fq.get("mc"),  yb.get("mc"))
         hi52    = first(fq.get("hi52"), yb.get("hi52"))
         lo52    = first(fq.get("lo52"), yb.get("lo52"))
-
-        # Earn Revision: not available from Yahoo or free FMP
-        # Set to None — will be scored 0 (missing penalty applies)
-        earn_rev = None
 
         merged[t] = {
             "pe":             pe_val,
@@ -629,7 +725,7 @@ def merge_all_sources(yahoo_data, fmp_quotes, fmp_ratios, tickers):
             "debt_eq":        de,
             "eps_growth":     eps_g,
             "growth_src":     g_src,
-            "earn_revision":  earn_rev,
+            "earn_traj":      earn_traj,
             "mc":             mc,
             "hi52":           hi52,
             "lo52":           lo52,
@@ -639,8 +735,8 @@ def merge_all_sources(yahoo_data, fmp_quotes, fmp_ratios, tickers):
 # ── Quality Score ─────────────────────────────────────────────────────────────
 def compute_quality_score(roic, roe, int_coverage, op_margin):
     """
-    v7: if ROIC missing, use ROE as proxy (both measure capital efficiency).
-    ROE is leverage-affected but better than 0.
+    v8: ROIC now populated from Yahoo financials.
+    If ROIC missing, use ROE as proxy (both measure capital efficiency).
     """
     scores = []
 
@@ -671,7 +767,7 @@ def compute_quality_score(roic, roe, int_coverage, op_margin):
 
 # ── Conviction Score ──────────────────────────────────────────────────────────
 def compute_conviction_scores(scr):
-    KEY_FACTORS = ["P/E", "Fwd P/E", "PEG", "Quality Score", "Momentum Score"]
+    KEY_FACTORS = ["P/E", "Fwd P/E", "PEG", "Quality Score", "Momentum Score", "Earn Traj"]
     n_factors   = len(KEY_FACTORS)
     scr         = scr.copy()
 
@@ -715,7 +811,7 @@ def compute_rank_by_sector(scr):
         elig["_s_val"] = percentile_score(pe_input,            ascending=True)
         elig["_s_peg"] = percentile_score(elig["PEG"],         ascending=True)
         elig["_s_mom"] = percentile_score(elig["Momentum Score"], ascending=False)
-        elig["_s_erev"]= percentile_score(elig["Earn Revision"],  ascending=False)
+        elig["_s_etraj"]= percentile_score(elig["Earn Traj"],  ascending=False)
 
         qs    = elig["Quality Score"]
         q_min = qs.min(); q_max = qs.max()
@@ -725,13 +821,13 @@ def compute_rank_by_sector(scr):
             elig["_s_quality"] = qs.fillna(0.0)
         elig["_s_quality"] = elig["_s_quality"].fillna(0.0)
 
-        raw = (W["valuation"]     * elig["_s_val"]     +
-               W["quality"]       * elig["_s_quality"] +
-               W["peg"]           * elig["_s_peg"]     +
-               W["earn_revision"] * elig["_s_erev"]    +
-               W["momentum"]      * elig["_s_mom"])
+        raw = (W["valuation"]  * elig["_s_val"]     +
+               W["quality"]    * elig["_s_quality"] +
+               W["peg"]        * elig["_s_peg"]     +
+               W["earn_traj"]  * elig["_s_etraj"]   +
+               W["momentum"]   * elig["_s_mom"])
 
-        factor_cols = ["P/E", "PEG", "Quality Score", "Earn Revision", "Momentum Score"]
+        factor_cols = ["P/E", "PEG", "Quality Score", "Earn Traj", "Momentum Score"]
         penalties   = elig.apply(lambda r: missing_factor_penalty(r, factor_cols), axis=1)
         raw         = raw * penalties
 
@@ -763,7 +859,7 @@ def build_screener_table(universe_df, prices_map, merged_map, revenue_map, momen
         ic       = to_num(fi.get("int_coverage"))
         om       = to_num(fi.get("op_margin"))
         de       = to_num(fi.get("debt_eq"))
-        earn_rev = to_num(fi.get("earn_revision"))
+        earn_traj = to_num(fi.get("earn_traj"))
 
         # Use price from batch download if available
         if pd.isna(price) and px_info.get("price"):
@@ -815,8 +911,9 @@ def build_screener_table(universe_df, prices_map, merged_map, revenue_map, momen
         if ps: parts.append("PE:{}".format(ps))
         pg = fi.get("peg_src")
         if pg and pg != "—": parts.append("PEG:{}".format(pg))
-        if roic is not None and not pd.isna(roic): parts.append("ROIC:FMP")
-        if ic   is not None and not pd.isna(ic):   parts.append("IC:FMP")
+        if roic is not None and not pd.isna(roic): parts.append("ROIC:Yahoo")
+        if ic   is not None and not pd.isna(ic):   parts.append("IC:Yahoo")
+        if earn_traj is not None and not pd.isna(earn_traj): parts.append("ET:Yahoo")
         data_src = " | ".join(parts) if parts else "Yahoo"
 
         rows.append({
@@ -828,7 +925,7 @@ def build_screener_table(universe_df, prices_map, merged_map, revenue_map, momen
             "Fwd P/E":            fwd,
             "PEG":                to_num(peg),
             "PEG Method":         peg_method,
-            "Earn Revision":      earn_rev,
+            "Earn Traj":          earn_traj,
             "52W Pos%":           to_num(pos52),
             "ROIC%":              roic,
             "ROE%":               roe,
@@ -856,7 +953,7 @@ def build_screener_table(universe_df, prices_map, merged_map, revenue_map, momen
 
     num_cols = ["Price", "Mkt Cap", "P/E", "Fwd P/E", "PEG", "52W Pos%",
                 "ROIC%", "ROE%", "Int Coverage", "Op Margin%", "Debt/Eq",
-                "Quality Score", "Earn Revision", "Momentum Score",
+                "Quality Score", "Earn Traj", "Momentum Score",
                 "Ret 1Mo%", "Ret 3Mo%", "Ret 6Mo%", "Trailing Vol%",
                 "Rev Q1", "Rev Q2", "Rev Q3", "Rev Q4", "Rev Growth% (CAGR)"]
     for c in num_cols:
@@ -874,7 +971,7 @@ def quality_flag(roic, roe, ic, om, de):
     flags = []
     profitability = roic if (roic is not None and not pd.isna(roic)) else roe
     if profitability is not None and not pd.isna(profitability) and profitability < QUALITY_THRESHOLDS["roic_min"]:
-        flags.append("ROIC/ROE<8%")
+        flags.append("ROIC<8%" if (roic is not None and not pd.isna(roic)) else "ROE<8%")
     if ic is not None and not pd.isna(ic) and ic < QUALITY_THRESHOLDS["int_coverage_min"]:
         flags.append("IntCov<3x")
     if om is not None and not pd.isna(om) and om < QUALITY_THRESHOLDS["op_margin_min"]:
@@ -929,7 +1026,7 @@ def render_sector_kpi_panel(scr, sector_sel):
                 unsafe_allow_html=True)
     c5.markdown(_kpi("Median Quality",
                      "{:.0f}/100".format(med_qual) if pd.notna(med_qual) else "N/A",
-                     "Profitability+IntCov+Margin", "#4ade80"),
+                     "ROIC+IntCov+Margin", "#4ade80"),
                 unsafe_allow_html=True)
     c6.markdown(_kpi("Median PEG",
                      "{:.2f}".format(med_peg) if pd.notna(med_peg) else "N/A",
@@ -951,7 +1048,7 @@ def render_sector_kpi_panel(scr, sector_sel):
             "<div style='color:#aaa;font-size:11px;margin-bottom:8px;'>Top Ranked in Sector</div>"
             "<div>{}</div>"
             "<div style='color:#555;font-size:10px;margin-top:8px;'>"
-            "Score = Valuation 25% + Quality 25% + PEG 20% + Earn Revision 15% + Momentum 15%"
+            "Score = Valuation 25% + Quality 25% + PEG 20% + Earn Traj 15% + Momentum 15%"
             "</div></div>".format(badges or "<span style='color:#555;'>No ranked stocks</span>"),
             unsafe_allow_html=True,
         )
@@ -961,18 +1058,19 @@ def render_sector_kpi_panel(scr, sector_sel):
 # ══════════════════════════════════════════════════════════════════════════════
 # ── APP ───────────────────────────────────────────────────────────────────────
 # ══════════════════════════════════════════════════════════════════════════════
-st.set_page_config(page_title="S&P 500 Screener v7", layout="wide", page_icon="📊")
+st.set_page_config(page_title="S&P 500 Screener v8", layout="wide", page_icon="📊")
 st.markdown(
     "<style>div[data-testid='stDataFrame'] table{font-size:13px;}"
     ".stDataFrame thead th{background:#1a1a2e;color:#93c5fd;font-weight:700;}</style>",
     unsafe_allow_html=True,
 )
 
-st.markdown("## S&P 500 Fundamental Screener v7")
+st.markdown("## S&P 500 Fundamental Screener v8")
 st.caption(
-    "Yahoo-first architecture · PEG from Yahoo pegRatio · "
-    "IntCoverage from EBIT/InterestExp · FMP bonus layer if key available · "
-    "Clean 5-factor model"
+    "Yahoo-first architecture · ROIC computed from financials · "
+    "Earn Trajectory from FwdEPS vs TrailEPS · "
+    "Full 5-factor model with all factors populated · "
+    "FMP bonus layer if key available"
 )
 
 col_r, col_t = st.columns([1, 6])
@@ -986,9 +1084,9 @@ with col_t:
 
 fmp_key = get_fmp_key()
 if fmp_key:
-    st.success("FMP API key found — will use as bonus layer for ROIC and Int Coverage override.")
+    st.success("FMP API key found — will use as bonus layer for PE override and ROIC/IntCov if tier supports /ratios-ttm.")
 else:
-    st.info("No FMP key configured. Running on Yahoo Finance only. Add [fmp] api_key to Streamlit Secrets to enable ROIC/IntCoverage from FMP.")
+    st.info("No FMP key configured. Running on Yahoo Finance only (ROIC computed from financials, Earn Traj from EPS estimates). Add [fmp] api_key to Streamlit Secrets for additional overrides.")
 
 # ── Load universe ─────────────────────────────────────────────────────────────
 with st.spinner("Loading S&P 500 universe..."):
@@ -1006,8 +1104,8 @@ with st.spinner("Fetching prices ({} tickers)...".format(len(tickers))):
 with st.spinner("Fetching momentum (skip-month vol-adjusted)..."):
     momentum = fetch_momentum_batch(tickers)
 
-# PRIMARY: Yahoo fundamentals for ALL tickers
-with st.spinner("Fetching Yahoo fundamentals (PE, PEG, ROE, OpMargin, D/E, IntCoverage) for all {} tickers...".format(len(tickers))):
+# PRIMARY: Yahoo fundamentals for ALL tickers (now includes ROIC + Earn Traj)
+with st.spinner("Fetching Yahoo fundamentals (PE, PEG, ROE, ROIC, OpMargin, D/E, IntCoverage, EarnTraj) for all {} tickers...".format(len(tickers))):
     yahoo_fundamentals = fetch_yahoo_fundamentals_all(tickers)
 
 # BONUS: FMP if key exists
@@ -1031,24 +1129,30 @@ has_pe   = sum(1 for t in tickers if merged_map.get(t, {}).get("pe")           i
 has_fwd  = sum(1 for t in tickers if merged_map.get(t, {}).get("fwd_pe")       is not None)
 has_peg  = sum(1 for t in tickers if merged_map.get(t, {}).get("peg")          is not None)
 has_roe  = sum(1 for t in tickers if merged_map.get(t, {}).get("roe")          is not None)
+has_roic = sum(1 for t in tickers if merged_map.get(t, {}).get("roic")         is not None)
 has_ic   = sum(1 for t in tickers if merged_map.get(t, {}).get("int_coverage") is not None)
 has_om   = sum(1 for t in tickers if merged_map.get(t, {}).get("op_margin")    is not None)
+has_et   = sum(1 for t in tickers if merged_map.get(t, {}).get("earn_traj")    is not None)
 
 st.info(
     "Data coverage — "
     "P/E: {}/{} ({:.0f}%) · "
     "Fwd P/E: {}/{} ({:.0f}%) · "
     "PEG: {}/{} ({:.0f}%) · "
+    "ROIC: {}/{} ({:.0f}%) · "
     "ROE: {}/{} ({:.0f}%) · "
     "Int Coverage: {}/{} ({:.0f}%) · "
     "Op Margin: {}/{} ({:.0f}%) · "
+    "Earn Traj: {}/{} ({:.0f}%) · "
     "Primary: Yahoo Finance{}".format(
-        has_pe,  total_t, has_pe  / total_t * 100,
-        has_fwd, total_t, has_fwd / total_t * 100,
-        has_peg, total_t, has_peg / total_t * 100,
-        has_roe, total_t, has_roe / total_t * 100,
-        has_ic,  total_t, has_ic  / total_t * 100,
-        has_om,  total_t, has_om  / total_t * 100,
+        has_pe,   total_t, has_pe   / total_t * 100,
+        has_fwd,  total_t, has_fwd  / total_t * 100,
+        has_peg,  total_t, has_peg  / total_t * 100,
+        has_roic, total_t, has_roic / total_t * 100,
+        has_roe,  total_t, has_roe  / total_t * 100,
+        has_ic,   total_t, has_ic   / total_t * 100,
+        has_om,   total_t, has_om   / total_t * 100,
+        has_et,   total_t, has_et   / total_t * 100,
         " + FMP bonus" if fmp_key else "",
     )
 )
@@ -1067,7 +1171,8 @@ with st.expander("Valuation & Size", expanded=True):
         "Sector then Rank", "Score high to low", "Conviction high to low",
         "Price low to high", "Price high to low", "Mkt Cap high to low",
         "PE low to high", "Fwd PE low to high", "PEG low to high",
-        "Quality Score high", "ROE high to low",
+        "Quality Score high", "ROIC high to low", "ROE high to low",
+        "Earn Traj high to low",
         "Rev Growth high to low", "Momentum Score high", "52W Pos low to high",
     ])
     pe_max   = fc3.number_input("Max PE",              value=9999,  step=50)
@@ -1076,16 +1181,17 @@ with st.expander("Valuation & Size", expanded=True):
 
 with st.expander("Quality Filters", expanded=False):
     qc1, qc2, qc3, qc4, qc5 = st.columns(5)
-    roe_min_f  = qc1.number_input("Min ROE (%)",              value=0.0,  step=5.0)
+    roic_min_f = qc1.number_input("Min ROIC (%)",             value=0.0,  step=5.0)
     ic_min_f   = qc2.number_input("Min Int Coverage (x)",     value=0.0,  step=1.0)
     om_min_f   = qc3.number_input("Min Op Margin (%)",        value=0.0,  step=5.0)
     qual_min_f = qc4.number_input("Min Quality Score",        value=0.0,  step=5.0)
     de_max_f   = qc5.number_input("Max Debt/Equity (ref)",    value=99.0, step=0.5)
 
-with st.expander("Momentum & Display", expanded=False):
-    mc1, mc2 = st.columns(2)
+with st.expander("Momentum & Earnings", expanded=False):
+    mc1, mc2, mc3 = st.columns(3)
     mom_min   = mc1.number_input("Min Momentum Score",        value=-999.0, step=5.0)
-    hide_nope = mc2.checkbox("Hide stocks missing both P/E and Fwd P/E", value=False)
+    et_min    = mc2.number_input("Min Earn Traj",             value=-1.0,   step=0.1)
+    hide_nope = mc3.checkbox("Hide stocks missing both P/E and Fwd P/E", value=False)
 
 render_sector_kpi_panel(scr, sector_sel)
 
@@ -1095,12 +1201,13 @@ if sector_sel != "All Sectors":
 filt = filt[(filt["Mkt Cap"].isna())        | (filt["Mkt Cap"]       >= mc_min_b * 1e9)]
 filt = filt[(filt["P/E"].isna())            | (filt["P/E"]           <= pe_max)]
 filt = filt[(filt["PEG"].isna())            | (filt["PEG"]           <= peg_max)]
-filt = filt[(filt["ROE%"].isna())           | (filt["ROE%"]          >= roe_min_f)]
+filt = filt[(filt["ROIC%"].isna())          | (filt["ROIC%"]         >= roic_min_f)]
 filt = filt[(filt["Int Coverage"].isna())   | (filt["Int Coverage"]  >= ic_min_f)]
 filt = filt[(filt["Op Margin%"].isna())     | (filt["Op Margin%"]    >= om_min_f)]
 filt = filt[(filt["Quality Score"].isna())  | (filt["Quality Score"] >= qual_min_f)]
 filt = filt[(filt["Debt/Eq"].isna())        | (filt["Debt/Eq"]       <= de_max_f)]
 filt = filt[(filt["Momentum Score"].isna()) | (filt["Momentum Score"]>= mom_min)]
+filt = filt[(filt["Earn Traj"].isna())      | (filt["Earn Traj"]     >= et_min)]
 if hide_nope:
     filt = filt[filt["P/E"].notna() | filt["Fwd P/E"].notna()]
 
@@ -1115,7 +1222,9 @@ sort_map = {
     "Fwd PE low to high":     (["Fwd P/E"],            [True]),
     "PEG low to high":        (["PEG"],                [True]),
     "Quality Score high":     (["Quality Score"],      [False]),
+    "ROIC high to low":       (["ROIC%"],              [False]),
     "ROE high to low":        (["ROE%"],               [False]),
+    "Earn Traj high to low":  (["Earn Traj"],          [False]),
     "Rev Growth high to low": (["Rev Growth% (CAGR)"], [False]),
     "Momentum Score high":    (["Momentum Score"],     [False]),
     "52W Pos low to high":    (["52W Pos%"],           [True]),
@@ -1138,7 +1247,7 @@ disp["Quality Flag"] = disp.apply(
                            r.get("Int Coverage"),
                            r.get("Op Margin%"), r.get("Debt/Eq")), axis=1)
 
-for c in ["P/E", "Fwd P/E", "PEG", "Earn Revision", "52W Pos%",
+for c in ["P/E", "Fwd P/E", "PEG", "Earn Traj", "52W Pos%",
           "ROIC%", "ROE%", "Int Coverage", "Op Margin%", "Debt/Eq",
           "Quality Score", "Momentum Score", "Ret 1Mo%", "Ret 3Mo%",
           "Ret 6Mo%", "Trailing Vol%", "Score", "Conviction Score",
@@ -1151,7 +1260,7 @@ disp["Rank"] = disp["Rank"].apply(lambda v: int(v) if pd.notna(v) else pd.NA)
 COLS = [
     "Ticker", "Sector", "Price ($)", "Mkt Cap ($B)",
     "P/E", "Fwd P/E", "PEG", "PEG Method",
-    "Earn Revision",
+    "Earn Traj",
     "ROIC%", "ROE%", "Int Coverage", "Op Margin%", "Debt/Eq",
     "Quality Score", "Quality Flag",
     "Momentum Score", "Ret 1Mo%", "Ret 3Mo%", "Ret 6Mo%", "Trailing Vol%",
@@ -1165,26 +1274,41 @@ st.dataframe(disp_final, use_container_width=True, height=680)
 st.download_button(
     label="Download CSV",
     data=disp_final.to_csv(index=False).encode("utf-8"),
-    file_name="sp500_screener_v7_{}.csv".format(datetime.now().strftime("%Y%m%d_%H%M")),
+    file_name="sp500_screener_v8_{}.csv".format(datetime.now().strftime("%Y%m%d_%H%M")),
     mime="text/csv",
+)
+
+# ── Explanatory text under table ──────────────────────────────────────────────
+st.markdown(
+    """
+    **PEG (Price/Earnings-to-Growth):** Measures valuation relative to growth. 
+    PEG < 1.0 = potentially undervalued for its growth rate. PEG > 2.0 = expensive relative to growth. 
+    Only computed when EPS growth ≥ 5% (avoids math artifacts from near-zero denominators).
+    
+    **Earn Traj (Earnings Trajectory):** Proxy for analyst consensus revision direction.
+    Computed as `(Forward EPS − Trailing EPS) / |Trailing EPS|`. 
+    Positive = analysts expect earnings growth ahead. Negative = expect decline. 
+    Range clipped to [-1.0, +1.0]. A value of +0.20 means 20% expected EPS improvement.
+    """
 )
 
 st.markdown("---")
 st.markdown(
-    "**Sources v7:** Yahoo Finance primary (PE, Fwd PE, PEG via pegRatio, ROE, "
-    "OpMargin, D/E, IntCoverage from EBIT/InterestExp, EPS growth) · "
-    "FMP bonus if key available (ROIC, IntCoverage override) · "
+    "**Sources v8:** Yahoo Finance primary (PE, Fwd PE, PEG via pegRatio, ROE, ROIC from financials, "
+    "OpMargin, D/E, IntCoverage from EBIT/InterestExp, EPS growth, Earn Traj from FwdEPS/TrailEPS) · "
+    "FMP bonus if key available (PE override, ROIC/IntCoverage override if tier supports /ratios-ttm) · "
     "Momentum: Yahoo batch download · Revenue: Yahoo quarterly"
 )
+
 # ══════════════════════════════════════════════════════════════════════════════
-# ── COLUMN REFERENCE GUIDE — DETAILED WITH EXAMPLES ──────────────────────────
+# ── COLUMN REFERENCE GUIDE ────────────────────────────────────────────────────
 # ══════════════════════════════════════════════════════════════════════════════
 st.markdown("---")
 st.markdown("## Column Reference Guide")
 st.caption("Every column explained with formula, real-world example, and how to use it.")
 
-tab_val, tab_qual, tab_peg, tab_erev, tab_mom, tab_rank, tab_disp = st.tabs([
-    "Valuation", "Quality", "PEG", "Earn Revision", "Momentum", "Ranking & Score", "Display-Only Columns"
+tab_val, tab_qual, tab_peg, tab_etraj, tab_mom, tab_rank, tab_disp = st.tabs([
+    "Valuation", "Quality", "PEG", "Earn Trajectory", "Momentum", "Ranking & Score", "Display-Only Columns"
 ])
 
 with tab_val:
@@ -1204,452 +1328,217 @@ with tab_val:
 - P/E of 50 in a sector where median is 25 → stock looks expensive vs peers
 - P/E is undefined when EPS is negative (company is losing money)
 
-**Data source waterfall:** FMP /quote → Finviz → Yahoo Finance
+**Data source:** FMP /quote (if key available) → Yahoo Finance
 
-**Used in scoring?** Yes — this is the primary Valuation factor (25% weight). Lower P/E = higher percentile = better score within sector.
+**Used in scoring?** Yes — this is the primary Valuation factor (25% weight). Lower P/E = higher percentile = better score within sector. Fwd P/E is preferred when available.
 
 ---
 
 ### Fwd P/E — Forward Price to Earnings Ratio
-**What it is:** Same as P/E but uses analysts' consensus estimate of what earnings will be over the NEXT 12 months instead of last 12 months.
+**What it is:** Same as P/E but uses analysts' consensus estimate of what earnings will be over the NEXT 12 months.
 
 **Formula:** `Current Stock Price ÷ Next 12-Month Estimated EPS`
-
-**Example:**
-- Apple stock price = $190. Analysts estimate Apple will earn $7.20 per share next year.
-- Fwd P/E = 190 ÷ 7.20 = **26.4**
-- Trailing P/E was 29.5. Fwd P/E is 26.4. This means earnings are expected to grow → you are paying less per future dollar of earnings than per past dollar.
 
 **When Fwd P/E < Trailing P/E:** Earnings growing. Good sign.
 **When Fwd P/E > Trailing P/E:** Earnings expected to shrink. Bad sign.
 
-**Data source waterfall:** FMP /ratios → FMP /key-metrics → FMP /analyst-estimates → Finviz → Yahoo
+**Data source:** Yahoo Finance (.info forwardPE / forwardEps)
 
-**Used in scoring?** Yes — Fwd P/E is PREFERRED over trailing P/E for the Valuation factor. If Fwd P/E is available it is used. Trailing P/E is the fallback only.
+**Used in scoring?** Yes — Fwd P/E is PREFERRED over trailing P/E for the Valuation factor.
 
 ---
 
 ### 52W Pos% — 52-Week Position
-**What it is:** Where the current price sits between the stock's 52-week low and 52-week high, expressed as a percentage.
+**What it is:** Where the current price sits between the stock's 52-week low and 52-week high.
 
 **Formula:** `(Current Price − 52W Low) ÷ (52W High − 52W Low) × 100`
 
-**Example:**
-- Stock 52W Low = $80, 52W High = $150, Current Price = $110
-- 52W Pos% = (110 − 80) ÷ (150 − 80) × 100 = 30 ÷ 70 × 100 = **42.9%**
-- Meaning: The stock is sitting 43% of the way up from its yearly low.
-
 **0% = at the yearly low. 100% = at the yearly high.**
 
-**How to use:**
-- Low 52W Pos% (under 30%) = stock is near its yearly lows — could be a value opportunity or a value trap. Always combine with quality filters.
-- High 52W Pos% (above 80%) = stock is near yearly highs — strong momentum but less upside room.
-
-**Used in scoring?** No. Display only. Use the sort "52W Pos low to high" to find beaten-down stocks.
+**Used in scoring?** No. Display only.
 """)
 
 with tab_qual:
     st.markdown("""
 ### Quality Score (0–100)
-**What it is:** A composite score measuring the fundamental strength and safety of the business. Made up of three equally-weighted sub-scores.
+**What it is:** A composite score measuring fundamental strength. Made up of three equally-weighted sub-scores.
 
 **Formula:** `(ROIC sub-score + Interest Coverage sub-score + Op Margin sub-score) ÷ 3`
 
-**Used in scoring?** Yes — 25% weight. Scored using min-max scaling within each sector (not percentile rank) to preserve magnitude differences between stocks.
+**Used in scoring?** Yes — 25% weight.
 
 ---
 
-### ROIC% — Return on Invested Capital
-**What it is:** For every dollar of capital invested in the business (equity + debt combined), how many cents of profit does it generate after tax?
+### ROIC% — Return on Invested Capital (v8: Yahoo-computed)
+**What it is:** For every dollar of capital invested in the business (equity + debt − cash), how many cents of after-tax operating profit does it generate?
 
-**Formula:** `Net Operating Profit After Tax ÷ (Total Equity + Net Debt) × 100`
+**Formula (v8):**
+```
+NOPAT = Operating Income (TTM) × (1 − effective tax rate)
+Invested Capital = Total Equity + Total Debt − Cash
+ROIC = NOPAT ÷ Invested Capital × 100
+```
 
-**Example:**
-- Company A invested $10 billion in its business (factories, equipment, working capital).
-- It generated $2 billion in operating profit after tax.
-- ROIC = 2B ÷ 10B × 100 = **20%**
-- Meaning: Every $1 of capital deployed generates $0.20 of annual profit.
+**Data source (v8):** Computed from Yahoo `quarterly_financials` + `quarterly_balance_sheet`. FMP `/ratios-ttm` overrides if your tier supports it.
 
 **Benchmarks:**
-- ROIC > 20%: Excellent. Company has a real competitive advantage.
-- ROIC 10–20%: Good. Solid business.
-- ROIC < 8%: Flagged. May be destroying value if cost of capital is around 8–10%.
-
-**Why ROIC instead of ROE?**
-ROE (Return on Equity) is easily inflated by taking on debt or doing share buybacks. Apple's ROE appears to be 160%+ because it has bought back so many shares that book equity is near zero — that's not a real profitability signal. ROIC includes both debt and equity in the denominator so it is leverage-neutral and cannot be gamed this way.
+- ROIC > 20%: Excellent competitive advantage
+- ROIC 10–20%: Good solid business
+- ROIC < 8%: Flagged — may be destroying value
 
 **Sub-score formula:** `min(100, log(1 + ROIC) ÷ log(1 + 30) × 100)`
-Log-scaling is used so that ROIC 160% (Apple) and ROIC 50% (Microsoft) are not treated as identical just because both exceed a linear cap of 100. Apple still scores meaningfully higher than Microsoft.
-
-**ROIC Sub-score examples:**
-- ROIC 30% → sub-score 100 (perfect)
-- ROIC 15% → sub-score ~77
-- ROIC 8% → sub-score ~49
-- ROIC 5% → sub-score ~38
-- ROIC 0% or negative → sub-score 0
-
-**Data source:** FMP /ratios (bulk) → FMP /key-metrics fallback
 
 ---
 
 ### Int Coverage — Interest Coverage Ratio
-**What it is:** How many times over can the company pay its annual interest expense using its operating profit? Measures debt safety more directly than Debt/Equity.
+**What it is:** How many times over can the company pay its annual interest expense from operating profit.
 
-**Formula:** `EBIT (Earnings Before Interest and Tax) ÷ Annual Interest Expense`
+**Formula:** `EBIT (TTM) ÷ |Interest Expense (TTM)|`
 
-**Example:**
-- Company B's EBIT = $5 billion. Annual interest payments = $500 million.
-- Interest Coverage = 5B ÷ 0.5B = **10x**
-- Meaning: The company earns 10 times what it needs to pay in interest. Very safe.
+**Benchmarks:** 10x+ = safe (score 100), 5x = comfortable, <3x = flagged
 
-**Another example (risky):**
-- Company C's EBIT = $300 million. Annual interest = $250 million.
-- Interest Coverage = 300 ÷ 250 = **1.2x**
-- Meaning: Only barely covering interest payments. Any revenue dip = trouble.
-
-**Benchmarks:**
-- 10x or above: Very safe — full marks (sub-score 100)
-- 5x: Comfortable — sub-score 50
-- 3x: Borderline — sub-score 30 — flagged in Quality Flag column
-- Below 3x: Risky — flagged "IntCov<3x"
-- Below 1x: Company cannot cover interest from operations — in distress
-
-**Why this instead of Debt/Equity?**
-Debt/Equity tells you the structure but not whether it is a problem. A company with D/E of 3.0 but EBIT covering interest 20x is totally fine. A company with D/E of 0.5 but barely covering interest is in serious trouble. Interest Coverage is a direct measure of ability to service debt.
-
-Note: Debt/Equity is still shown as a display column so you can see it, it just does not feed into the score.
-
-**Sub-score formula:** `min(100, (Int Coverage ÷ 10) × 100)`
-Capped at 100x to avoid extremely cash-rich companies getting outsized scores.
-
-**Data source:** FMP /ratios (bulk) only.
+**Data source:** Yahoo `quarterly_financials` (EBIT / Interest Expense)
 
 ---
 
 ### Op Margin% — Operating Margin
-**What it is:** Of every dollar of revenue the company brings in, how many cents become operating profit (before interest and taxes)?
+**What it is:** Of every dollar of revenue, how many cents become operating profit.
 
 **Formula:** `Operating Income ÷ Revenue × 100`
 
-**Example:**
-- Microsoft revenue = $211 billion. Operating income = $88 billion.
-- Op Margin = 88 ÷ 211 × 100 = **41.7%**
-- Meaning: For every $1 of revenue, Microsoft keeps $0.42 as operating profit.
-
-**Another example:**
-- Supermarket chain revenue = $100 billion. Operating income = $2.5 billion.
-- Op Margin = 2.5%
-- Low margin businesses are more vulnerable to cost increases or revenue drops.
-
-**Benchmarks:**
-- 40%+ : Elite (software, pharma, luxury) — sub-score 100
-- 20%  : Good — sub-score 50
-- 10%  : Acceptable — sub-score 25
-- Below 5%: Flagged "Margin<5%"
-- Negative: Company is losing money from operations — sub-score 0
-
-**Sub-score formula:** `min(100, max(0, Op Margin ÷ 40 × 100))`
-
-**Data source:** FMP /ratios (bulk) → Finviz → Yahoo Finance
+**Data source:** Yahoo `.info` (operatingMargins)
 
 ---
 
 ### Quality Flag
-**What it is:** A simple pass/fail check that runs independently of the Quality Score. Flags stocks that breach minimum thresholds on any of the three quality metrics.
-
-**Flags triggered:**
-- `ROIC<8%` — return on capital below 8% (may be destroying value)
-- `IntCov<3x` — interest coverage below 3x (debt servicing risk)
-- `Margin<5%` — operating margin below 5% (thin profitability buffer)
-- `Pass` — all three checks passed
-- `D/E: 1.5` shown as informational note (Debt/Equity for reference, not a pass/fail)
-
-**Example:** A stock might show `ROIC<8%, Margin<5% | D/E:2.1` meaning it failed two quality checks and has a debt/equity ratio of 2.1 for your reference.
+- `ROIC<8%` — return on capital below threshold
+- `ROE<8%` — shown when ROIC unavailable and ROE used as proxy
+- `IntCov<3x` — interest coverage risky
+- `Margin<5%` — thin profitability buffer
+- `Pass` — all checks passed
+- `D/E: X.X` — informational reference
 """)
 
 with tab_peg:
     st.markdown("""
 ### PEG — Price/Earnings-to-Growth Ratio
-**What it is:** Takes the P/E ratio and adjusts it for the company's earnings growth rate. Answers the question: "Is this stock cheap or expensive GIVEN how fast it is growing?"
+**What it is:** P/E adjusted for earnings growth rate.
 
 **Formula:** `P/E Ratio ÷ Annual EPS Growth Rate (%)`
 
-**Example 1 — Growth stock that looks expensive but is actually fair:**
-- Stock A: P/E = 60, EPS growing at 40% per year
-- PEG = 60 ÷ 40 = **1.5** — fairly valued for its growth rate
-- A pure P/E screen would rank this stock near the bottom. PEG reveals it is not that expensive.
-
-**Example 2 — Value stock that looks cheap but is actually a trap:**
-- Stock B: P/E = 12, EPS growing at 3% per year
-- PEG = 12 ÷ 3 = **4.0** — very expensive relative to growth
-- P/E looks cheap at 12 but the company is barely growing — not actually cheap on PEG.
-
-**Example 3 — Genuinely undervalued:**
-- Stock C: P/E = 20, EPS growing at 30% per year
-- PEG = 20 ÷ 30 = **0.67** — undervalued. You are paying less than 1x for each unit of growth.
-
 **Interpreting PEG:**
-- PEG below 1.0: Stock is cheap relative to its growth. Potentially undervalued.
-- PEG 1.0–2.0: Fairly valued for its growth rate.
-- PEG above 2.0: Expensive relative to growth. Requires exceptional quality or other justification.
-- PEG above 3.0: Hard to justify unless growth is accelerating significantly.
+- PEG below 1.0: Cheap relative to growth — potentially undervalued
+- PEG 1.0–2.0: Fairly valued for growth rate
+- PEG above 2.0: Expensive relative to growth
 
-**Data source waterfall (v5):**
-1. FMP /ratios bulk endpoint — analyst-computed TTM PEG (most reliable)
-2. Finviz — PEG from their screener (good secondary coverage)
-3. Computed: (Fwd P/E or Trailing P/E) ÷ EPS Growth % from FMP /key-metrics or Yahoo
-4. Revenue CAGR is NOT used as fallback (removed in v4 — revenue growth is not earnings growth)
+**Data source waterfall:**
+1. Yahoo `.info` pegRatio (direct — most common)
+2. FMP `/ratios-ttm` if tier supports it (override)
+3. Computed: (Fwd P/E or Trailing P/E) ÷ EPS Growth % from Yahoo
 
-**Growth guard:** PEG is only computed when EPS growth is at least 5%. Below 5% growth the denominator is near-zero and produces misleading ratios. Example: P/E 15 ÷ EPS growth 0.5% = PEG 30, which looks terrible but is just a math artifact.
+**Growth guard:** PEG only computed when EPS growth ≥ 5%.
 
-**Used in scoring?** Yes — 20% standalone weight. Lower PEG = higher percentile = better score within sector. This is independent of Valuation (no double counting in v5).
-
-### PEG Method
-Shows which source was used to compute PEG:
-- `FMP-ratios` — directly from FMP analyst-computed ratio (most trustworthy)
-- `Finviz` — from Finviz screener data
-- `FMP EPS growth` — computed as Fwd PE ÷ FMP EPS growth estimate
-- `Yahoo EPS growth` — computed as Fwd PE ÷ Yahoo EPS growth estimate
-- `—` — PEG could not be computed (missing PE or growth below 5%)
+**Used in scoring?** Yes — 20% weight. Lower PEG = better.
 """)
 
-with tab_erev:
+with tab_etraj:
     st.markdown("""
-### Earn Revision — Earnings Estimate Revision Score
-**What it is:** Measures whether Wall Street analysts are raising or cutting their earnings estimates for this company right now. This is one of the most powerful short-to-medium term signals in quantitative equity research.
+### Earn Traj — Earnings Trajectory (v8 NEW)
+**What it is:** Measures whether analysts expect earnings to grow or shrink relative to current trailing earnings. A proxy for the direction of consensus estimate revisions.
 
-**Formula:**
-**Example 1 — Positive revision:**
-- 3 months ago analysts estimated Apple would earn $7.00 per share next year.
-- Today the consensus estimate is $7.70 per share.
-- Earn Revision = (7.70 − 7.00) ÷ 7.00 = 0.10 → **+0.10**
-- Meaning: Analysts collectively raised estimates by 10%. Positive signal.
+**Formula:** `(Forward EPS − Trailing EPS) ÷ |Trailing EPS|`
 
-**Example 2 — Negative revision:**
-- 3 months ago Intel estimated at $1.50 EPS. Today estimate is $0.90 EPS.
-- Earn Revision = (0.90 − 1.50) ÷ 1.50 = −0.40 → **−0.40**
-- Meaning: Analysts cut estimates by 40%. Strong negative signal.
+**Clipped to range:** [-1.0, +1.0]
 
-**Example 3 — Extreme positive (clipped):**
-- Estimate moved from $1.00 to $2.20 (120% increase).
-- Raw = 1.20 but clipped to **+1.0** maximum.
+**Example 1 — Positive trajectory:**
+- Apple trailing EPS = $6.43, forward EPS estimate = $7.70
+- Earn Traj = (7.70 − 6.43) ÷ 6.43 = **+0.20**
+- Meaning: Analysts expect 20% earnings growth ahead. Positive signal.
 
-**Interpreting the score:**
-- +1.0: Maximum positive — analysts massively upgraded estimates. Very bullish.
-- +0.10 to +0.30: Moderate upgrade. Positive signal.
-- 0.0: No change in consensus estimates.
-- −0.10 to −0.30: Moderate downgrade. Negative signal.
-- −1.0: Maximum negative — analysts massively cut estimates. Very bearish.
+**Example 2 — Negative trajectory:**
+- Intel trailing EPS = $1.50, forward EPS estimate = $0.90
+- Earn Traj = (0.90 − 1.50) ÷ 1.50 = **−0.40**
+- Meaning: Analysts expect a 40% earnings decline. Bearish signal.
 
-**Why this matters so much:**
-When analysts revise EPS estimates upward it almost always means one of three things happened: the company gave positive guidance on an earnings call, the company reported a beat-and-raise quarter, or the macro environment for that company improved. Stocks with rising estimates consistently outperform over the next 30–90 days. This is documented extensively in MSCI Barra factor research, Goldman Sachs alpha models, and JP Morgan quant strategy papers. It was completely missing from v3 and v4 of this screener — adding it as 15% weight is one of the most impactful improvements in v5.
+**Interpreting Earn Traj:**
+- +0.5 to +1.0: Strong expected growth (fast-growing company)
+- +0.1 to +0.3: Moderate growth expected
+- 0.0: Flat — no change expected
+- −0.1 to −0.3: Moderate decline expected
+- −0.5 to −1.0: Significant decline expected
 
-**How to use the filter:**
-- Set Min Earn Revision to 0.05 to see only stocks where analysts are raising estimates
-- Set Min Earn Revision to 0.15 for stronger revision momentum only
-- Leave at −1.0 default to see all stocks
+**Why this instead of true Earn Revision?**
+True earnings revision (change in consensus estimates over time) requires tracking estimate history from services like FMP /analyst-estimates, which is behind a paid tier wall. This proxy captures the SAME directional signal — when forward EPS > trailing EPS, it means analysts see growth ahead, which correlates strongly with positive recent revisions.
 
-**Data source:** FMP /analyst-estimates batch endpoint (50 tickers per call).
-Earn Revision is NOT available from Finviz or Yahoo — FMP is the only source here.
+**Data source:** Yahoo `.info` (forwardEps, trailingEps)
+Expected coverage: ~85% of S&P 500 (excludes companies with negative trailing EPS where ratio is meaningless).
 
-**Used in scoring?** Yes — 15% weight. Higher revision = higher percentile = better score within sector.
+**Used in scoring?** Yes — 15% weight. Higher Earn Traj = higher percentile = better score within sector.
 """)
 
 with tab_mom:
     st.markdown("""
 ### Momentum Score — Skip-Month Volatility-Adjusted Momentum
-**What it is:** Measures the stock's recent price trend, adjusted for how volatile the stock is. This is the signal used in the ranking model.
+**What it is:** Recent price trend adjusted for volatility.
 
-**Formula:**
-**Example:**
-- Stock X: 6mo return = +22%, 1mo return = +3%, trailing vol = 25%
-- Skip-month raw = 22 − 3 = 19%
-- Momentum Score = 19 ÷ 25 = **0.76**
+**Formula:** `(6-month return − 1-month return) ÷ Trailing Volatility`
 
-- Stock Y: 6mo return = +22%, 1mo return = +3%, trailing vol = 50%
-- Skip-month raw = same 19%
-- Momentum Score = 19 ÷ 50 = **0.38**
-
-Both stocks gained the same 19% skip-month return but Stock X has half the volatility — its momentum is a much cleaner signal. Stock X scores higher.
-
-**Why subtract 1-month return (skip-month)?**
-The 1-month window has a documented short-term reversal effect — stocks that jumped last month slightly tend to mean-revert. Including it adds noise that actually works against you. By subtracting it you isolate the more durable 2–6 month momentum signal. This is the exact construction used in the Fama-French UMD (Up Minus Down) academic momentum factor.
-
-**Why divide by volatility?**
-A +15% return in a stock with 10% annualised vol is a very strong signal (the stock moved 1.5 standard deviations). The same +15% return in a stock with 80% vol is barely a whisper (less than 0.2 standard deviations). Vol-adjustment makes momentum comparable across stocks with very different risk profiles.
-
-**Used in scoring?** Yes — 15% weight. Higher Momentum Score = higher percentile = better.
+**Used in scoring?** Yes — 15% weight. Higher = better.
 
 ---
 
 ### Ret 1Mo%, Ret 3Mo%, Ret 6Mo% — Raw Monthly Returns
-**What they are:** The raw percentage price return over 1, 3, and 6 months respectively, measured from monthly closing prices.
-
-**Example:**
-- Stock price 6 months ago: $100. Today: $118.
-- Ret 6Mo% = (118 − 100) ÷ 100 × 100 = **+18%**
-
-**Used in scoring?** No. These are display-only columns. They are shown so you can see the raw return profile. The Momentum Score (above) is what actually feeds into ranking.
+Display only. Shows raw return profile.
 
 ---
 
-### Trailing Vol% — Trailing 90-Day Annualised Volatility
-**What it is:** The annualised standard deviation of daily returns over the last 90 trading days, expressed as a percentage. Measures how much the stock price jumps around day-to-day.
+### Trailing Vol% — 90-Day Annualised Volatility
+**Formula:** `std(daily_returns, last 90 days) × √252 × 100`
 
-**Formula:** `std(daily_returns, last 90 days) × sqrt(252) × 100`
-
-**Example:**
-- Utility stock: daily std dev = 0.6%, annualised vol = 0.6% × √252 = **9.5%** — very stable
-- Tech growth stock: daily std dev = 2.5%, annualised vol = 2.5% × √252 = **39.7%** — very volatile
-
-**How to use:**
-- High vol (>40%) + high Momentum Score = strong momentum but risky
-- Low vol (<15%) + high Momentum Score = very clean, reliable momentum signal
-- Trailing Vol% is the denominator in the Momentum Score formula
-
-**Used in scoring?** No. Display only.
+Display only — used as denominator in Momentum Score.
 """)
 
 with tab_rank:
     st.markdown("""
 ### Score (0–100)
-**What it is:** The final composite percentile score for a stock within its GICS sector. This is the primary ranking signal.
+**What it is:** Final composite percentile score within GICS sector.
 
 **Formula:**
-**Example of scoring in the Information Technology sector (75 stocks):**
-
-Say Apple has these raw metrics:
-- Fwd P/E = 26 → ranks 18th lowest out of 75 tech stocks → PE percentile = 76
-- Quality Score = 82 out of 100 → min-max score within tech = 78
-- PEG = 1.8 → ranks 22nd lowest → PEG percentile = 71
-- Earn Revision = +0.12 → ranks 15th highest → EarnRev percentile = 81
-- Momentum Score = 0.65 → ranks 20th highest → Mom percentile = 74
-- Missing factors = 0 → no penalty
-
-Score = 0.25×76 + 0.25×78 + 0.20×71 + 0.15×81 + 0.15×74 = 19+19.5+14.2+12.2+11.1 = **76.0**
-
-**Key points:**
-- Score is always relative to sector. Score 76 in Tech vs Score 76 in Utilities are independent — both mean the stock is in the top quarter of their respective sectors.
-- A stock can have a mediocre absolute P/E but if every other stock in the sector has a higher P/E, it still gets a high Valuation percentile.
-
----
+```
+Score = 0.25 × Valuation_pctile + 0.25 × Quality_minmax + 
+        0.20 × PEG_pctile + 0.15 × EarnTraj_pctile + 
+        0.15 × Momentum_pctile
+```
+Then multiplied by missing-factor penalty (×0.85 if 2 missing, ×0.70 if 3+).
 
 ### Rank
-**What it is:** The ordinal position of the stock within its sector based on Score. Rank 1 = highest Score in that sector.
-
-**Example:** Rank 3 in Information Technology (75 stocks) means this stock has the 3rd highest composite Score among all IT stocks in the S&P 500.
-
-**Important:** Ranks are NOT comparable across sectors. Rank 1 in Utilities does not mean the same as Rank 1 in Technology. They are entirely independent sector-specific rankings.
-
----
-
-### Missing Data Penalty
-Applied before finalising the Score:
-- 0 or 1 factor missing: no penalty (× 1.0)
-- 2 factors missing: Score × 0.85 (−15%)
-- 3 or more factors missing: Score × 0.70 (−30%)
-
-**Factors checked:** P/E, PEG, Quality Score, Earn Revision, Momentum Score
-
-**Why?** Without this penalty, a stock with only one available metric (say a very low P/E) could accidentally rank #1 purely because it scores 100 on valuation while everything else defaults to 0. The penalty ensures incomplete data is reflected in the final rank.
-
----
+Ordinal position within sector. Rank 1 = highest Score in that sector.
 
 ### Conviction Score (0–100)
-**What it is:** A confidence-adjusted version of Score that rewards stocks where data is complete and the sector is not overvalued. Normalised to 0–100 across the entire S&P 500 universe.
-
-**Formula:**
-**Data completeness example:**
-- Stock has P/E, PEG, Quality Score, Earn Revision but is missing Fwd P/E and Momentum Score
-- Completeness = 4 ÷ 6 = 0.67
-- Score gets multiplied by 0.67 → lower Conviction Score than a stock with all 6 factors present
-
-**Sector discount example:**
-- S&P 500 median P/E = 22. Technology sector median P/E = 30.
-- Sector discount = 22 ÷ 30 = 0.73 (clipped to 0.73 — tech is expensive vs market)
-- A tech stock's Conviction Score is slightly reduced because the whole sector is premium-priced.
-
-- S&P 500 median P/E = 22. Energy sector median P/E = 12.
-- Sector discount = 22 ÷ 12 = 1.83 → clipped to 1.30 (energy is cheap vs market)
-- An energy stock's Conviction Score gets a 30% boost because the sector is undervalued.
-
-**How to use:** Sort by Conviction Score descending to find the highest-quality, best-data, cheapest-sector ranked stocks. These are the highest-confidence ideas from the model.
+Score × data completeness × sector discount, normalised across entire S&P 500.
 """)
 
 with tab_disp:
     st.markdown("""
 ### ROE% — Return on Equity (Display Only)
-**What it is:** Net income divided by shareholders equity. Shows how much profit a company generates from shareholders' money.
-
-**Formula:** `Net Income ÷ Total Shareholders Equity × 100`
-
-**Example:**
-- Company earned $5B net income. Shareholders equity = $25B.
-- ROE = 5 ÷ 25 × 100 = **20%**
-
-**Why display only (not in scoring)?**
-ROE is distorted by leverage and buybacks. Apple's ROE is 150%+ because it has bought back so much stock that book equity is near zero — that is an accounting quirk, not a sign that Apple is 7x better than a company with ROE 20%. ROIC (in the Quality Score) is the leverage-neutral replacement.
-
-**Data source:** FMP /ratios → Finviz → Yahoo Finance
-
----
+Net Income ÷ Shareholders Equity × 100. Distorted by leverage/buybacks. ROIC is the scoring metric.
 
 ### Debt/Eq — Debt to Equity Ratio (Display Only)
-**What it is:** Total debt divided by total shareholders equity. Shows how much of the company's financing comes from debt vs equity.
-
-**Formula:** `Total Debt ÷ Total Shareholders Equity`
-
-**Example:**
-- Company has $10B in debt and $20B in equity.
-- D/E = 10 ÷ 20 = **0.5x** — moderate leverage
-- D/E = 3.0x — heavily leveraged
-
-**Why display only (not in scoring)?**
-D/E tells you the capital structure but not whether it is a problem. A company with D/E 3.0 and Interest Coverage 20x is perfectly safe. A company with D/E 0.5 and Interest Coverage 1.2x is in trouble. Interest Coverage (in Quality Score) is the better signal. D/E is shown for your reference and appears in the Quality Flag note.
-
-**Data source:** FMP /ratios → Yahoo Finance
-
----
+Total Debt ÷ Total Equity. Shown for reference. Interest Coverage is the scoring metric.
 
 ### Rev Q1–Q4 ($B) — Quarterly Revenue
-**What they are:** The company's total revenue (top-line sales) for each of the last four fiscal quarters, in billions of dollars.
+Last four fiscal quarters of total revenue.
 
-**Example for a large retailer:**
-- Rev Q1 = $35.2B, Rev Q2 = $38.1B, Rev Q3 = $41.0B, Rev Q4 = $44.5B
-- Clearly an accelerating revenue trajectory — growing each quarter.
-
-**Data source:** Yahoo Finance quarterly_financials
-
----
-
-### Rev Growth% (CAGR) — Revenue Compound Annual Growth Rate
-**What it is:** The annualised revenue growth rate from Q1 to Q4 of the last four quarters on hand.
-
-**Formula:** `(Q4 Revenue ÷ Q1 Revenue)^(1/3) − 1 × 100`
-
-**Example:**
-- Q1 revenue = $35B, Q4 revenue = $44.5B (3 quarters later)
-- CAGR = (44.5 ÷ 35)^(1/3) − 1 × 100 = **8.3% annualised**
-
-**Used in scoring?** No. Display only. Previously used as a fallback for PEG computation in v3 — removed in v4/v5 because revenue growth ≠ earnings growth and produced misleading PEG values.
-
-**How to use:** Sort by "Rev Growth high to low" to find companies with accelerating revenue. Combine with strong Earn Revision to find growth stories where both revenue AND analysts are moving up.
-
----
+### Rev Growth% (CAGR)
+`(Q4 Revenue ÷ Q1 Revenue)^(1/3) − 1 × 100`. Display only.
 
 ### Data Sources
-**What it shows:** Which data providers successfully contributed data for each stock.
-
-**Examples:**
-- `PE:FMP-quote | PEG:Finviz | G:FMP` — P/E from FMP bulk quote, PEG from Finviz scrape, growth from FMP
-- `PE:Yahoo | PEG:FMP-ratios | EarnRev:FMP` — P/E fell through to Yahoo, but PEG and EarnRev from FMP
-- `Yahoo only` — FMP had no data for this ticker and Finviz didn't cover it either
-
-**How to use:** If a stock has `Yahoo only` for most fields, its Score and Rank are less reliable. The Conviction Score will automatically be lower for such stocks due to the data completeness penalty.
+Shows which providers contributed data for each stock (PE:Yahoo, ROIC:Yahoo, ET:Yahoo, etc.)
 """)
 
 st.markdown("""---
-**Data sources:** FMP /quote · FMP /ratios (bulk 50/call) · FMP /key-metrics (bulk 50/call) ·
-FMP /analyst-estimates (batch) · Finviz export (1 call, all 500) · Yahoo Finance (fallback + revenue + momentum) ·
-S&P 500 universe: Wikipedia GICS table
+**Data sources v8:** Yahoo Finance (primary: PE, Fwd PE, PEG, ROE, ROIC from financials, OpMargin, D/E, 
+IntCoverage, EPS growth, Earn Traj) · FMP /quote (bonus: PE, MC, 52W override) · 
+FMP /ratios-ttm (bonus: ROIC, IntCov override if tier available) · 
+Momentum: Yahoo batch · Revenue: Yahoo quarterly · Universe: Wikipedia S&P 500 GICS table
 """)

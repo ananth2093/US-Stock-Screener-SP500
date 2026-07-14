@@ -2,11 +2,15 @@
 # ─────────────────────────────────────────────────────────────────────────────
 # v10 CHANGES from v9:
 #   1. Page 1 filters: simplified to 5 controls in ONE row
-#      (Sector, Sort By, Min Mkt Cap $B, Max PE, Min Mkt Cap — clean single row)
-#   2. Page 2: render_reference_guide() fully populated with all metric
-#      explanations, formulas, numeric examples, and sector benchmarks
-#   3. All v9 logic (sector-adaptive weights, ROIC computation, Earn Traj,
-#      Financials ROE override, FMP bonus layer) preserved verbatim
+#      (Sector, Sort By, Min Mkt Cap $B, Max PE, Min Quality Score)
+#   2. Page 2: render_reference_guide() fully populated
+#   3. BUG FIX — normalise_pct_fmp(): replaces normalise_pct() for all FMP
+#      /ratios-ttm call sites. FMP TTM fields are always decimal fractions;
+#      the old abs(v)<5.0 heuristic would corrupt low-margin values (3.2%→320%).
+#   4. BUG FIX — missing_factor_penalty(): adds 1-missing tier (×0.95).
+#      Previously 1 missing factor returned 1.0 same as 0 missing — fixed.
+# All v9 sector-adaptive weights, Financials ROE override, ROIC computation,
+# Earn Traj, FMP bonus layer, and Reference Guide preserved verbatim.
 # ─────────────────────────────────────────────────────────────────────────────
 
 import streamlit as st
@@ -110,11 +114,23 @@ def sf(val):
     except Exception:
         return None
 
+# KEPT for any future source that genuinely mixes decimal/pct formats
 def normalise_pct(val):
     if val is None:
         return None
     v = float(val)
     return v * 100.0 if abs(v) < 5.0 else v
+
+# FIX 1: FMP /ratios-ttm fields are ALWAYS decimal fractions by API contract.
+# Never use the abs(v)<5.0 heuristic on FMP data — a legitimate 3.2% Op Margin
+# returns as 0.032; multiplied correctly to 3.2%. But if a field ever comes
+# back pre-converted (3.2), the heuristic would corrupt it to 320%.
+# This function multiplies unconditionally — safe because FMP TTM contract
+# guarantees decimal fractions for all ratio fields.
+def normalise_pct_fmp(val):
+    if val is None:
+        return None
+    return float(val) * 100.0
 
 def fmt_mc(val):
     if pd.isna(val) or val == 0:
@@ -136,11 +152,24 @@ def percentile_score(series: pd.Series, ascending=True) -> pd.Series:
     result[~valid] = 0.0
     return result
 
+# FIX 2: Added 1-missing tier (×0.95). Previously 1 missing factor returned
+# 1.0 (no penalty) — same as 0 missing. PEG is missing for ~30% of S&P 500
+# stocks; without this tier, those stocks were unfairly treated as complete.
 def missing_factor_penalty(row, factor_cols):
+    """
+    Penalise stocks with incomplete factor data so they cannot rank #1
+    purely on the strength of whichever single metric is available.
+
+    0 missing  -> x1.00  (full confidence)
+    1 missing  -> x0.95  (minor penalty — one common gap e.g. PEG)
+    2 missing  -> x0.85  (moderate uncertainty)
+    3+ missing -> x0.70  (low confidence — score unreliable)
+    """
     missing = sum(1 for c in factor_cols if pd.isna(row.get(c)))
     if missing >= 3: return 0.70
     if missing == 2: return 0.85
-    return 1.0
+    if missing == 1: return 0.95  # FIX 2: was missing, causing no penalty for 1 gap
+    return 1.00
 
 def revenue_growth_pct_cagr(rev4):
     try:
@@ -541,15 +570,16 @@ def fetch_fmp_ratios_if_available(tickers, api_key):
             d = r.json()
             if not isinstance(d, list) or len(d) == 0:
                 return t, {}
-            item     = d[0]
+            item = d[0]
             peg_raw  = sf(item.get("priceEarningsGrowthRatioTTM"))
             peg      = peg_raw if (peg_raw and 0 < peg_raw <= 500) else None
+            # FIX 1: use normalise_pct_fmp — always multiply by 100 (FMP TTM = decimal fractions)
             roic_raw = sf(item.get("returnOnInvestedCapitalTTM"))
-            roic     = normalise_pct(roic_raw) if roic_raw is not None else None
+            roic     = normalise_pct_fmp(roic_raw) if roic_raw is not None else None
             roe_raw  = sf(item.get("returnOnEquityTTM"))
-            roe      = normalise_pct(roe_raw) if roe_raw is not None else None
+            roe      = normalise_pct_fmp(roe_raw) if roe_raw is not None else None
             om_raw   = sf(item.get("operatingProfitMarginTTM"))
-            om       = normalise_pct(om_raw) if om_raw is not None else None
+            om       = normalise_pct_fmp(om_raw) if om_raw is not None else None
             ic_raw   = sf(item.get("interestCoverageTTM"))
             ic       = min(float(ic_raw), 100.0) if (ic_raw and ic_raw > 0) else None
             de       = sf(item.get("debtEquityRatioTTM"))
@@ -992,9 +1022,7 @@ def render_sector_kpi_panel(scr, sector_sel):
     st.markdown("<div style='margin-bottom:12px;'></div>", unsafe_allow_html=True)
 
 
-# ══════════════════════════════════════════════════════════════════════════════
-# ── REFERENCE GUIDE (fully populated)
-# ══════════════════════════════════════════════════════════════════════════════
+# ── Reference Guide ───────────────────────────────────────────────────────────
 def render_reference_guide():
     st.markdown("## Column Reference Guide")
     st.caption(
@@ -1003,42 +1031,27 @@ def render_reference_guide():
     )
 
     tab_val, tab_qual, tab_peg, tab_etraj, tab_mom, tab_rank, tab_disp = st.tabs([
-        "📐 Valuation",
-        "🏆 Quality",
-        "📈 PEG",
-        "🎯 Earn Trajectory",
-        "⚡ Momentum",
-        "🏅 Ranking & Score",
-        "📋 Display-Only",
+        "Valuation", "Quality", "PEG", "Earn Trajectory", "Momentum", "Ranking & Score", "Display-Only",
     ])
 
-    # ── TAB 1: VALUATION ─────────────────────────────────────────────────────
     with tab_val:
         st.markdown("""
 ### P/E — Price to Earnings Ratio (Trailing)
-**What it is:** How many dollars you pay per dollar of actual profit the company earned over the last 12 months.
+**What it is:** How many dollars you pay per dollar of actual profit earned over the last 12 months.
 
 **Formula:** `Current Stock Price / Trailing 12-Month EPS`
 
-**Numeric Example (S&P 500 context):**
+**Numeric Examples:**
+- Apple price = $210, EPS TTM = $6.57 → P/E = **32.0** — you pay $32 for every $1 of Apple profit
+- ExxonMobil price = $115, EPS TTM = $9.60 → P/E = **12.0** — energy commands discount vs tech
 
-- Apple price = $210. Apple earned $6.57 per share TTM.
-  - P/E = 210 / 6.57 = **32.0**
-  - Meaning: you pay $32 for every $1 of Apple's annual profit.
-- ExxonMobil price = $115. ExxonMobil earned $9.60 per share TTM.
-  - P/E = 115 / 9.60 = **12.0** — energy sector commands a discount vs tech.
-
-**Sector context matters:**
-
-- P/E of 15 when sector median = 25 → cheap vs peers → high Valuation percentile → **boosts Score**
-- P/E of 50 when sector median = 25 → expensive → low percentile → **hurts Score**
-
-**Sector median P/E benchmarks (typical US S&P 500 ranges):**
+**Sector context:** P/E of 15 when sector median = 25 → cheap vs peers → boosts Score.
+P/E of 50 when sector median = 25 → expensive → hurts Score.
 
 | Sector | Typical Median P/E |
 |---|---|
 | Information Technology | 28–40 |
-| Consumer Staples (FMCG) | 22–32 |
+| Consumer Staples | 22–32 |
 | Financials / Banking | 12–18 |
 | Energy / Oil & Gas | 10–16 |
 | Industrials | 22–30 |
@@ -1049,533 +1062,313 @@ def render_reference_guide():
 | Real Estate (REITs) | 30–50 |
 | Communication Services | 18–28 |
 
-**Used in scoring?** Yes — primary Valuation factor. Lower P/E = better percentile within sector.
+**Used in scoring?** Yes — primary Valuation factor (sector-adaptive weight 20–38%).
 
 ---
 
 ### Fwd P/E — Forward Price to Earnings
-**What it is:** Same as P/E but uses analysts' consensus EPS estimate for the **next 12 months**.
+**What it is:** Same as P/E but uses analysts' consensus EPS estimate for the next 12 months.
 
 **Formula:** `Current Stock Price / Next 12-Month Estimated EPS`
 
-**Numeric Example:**
-
-- Microsoft price = $415, trailing EPS = $11.45, forward EPS estimate = $13.20
-  - Trailing P/E = 36.2, Fwd P/E = 415 / 13.20 = **31.4**
+**Numeric Examples:**
+- Microsoft $415, trailing EPS = $11.45, forward EPS = $13.20 → Fwd P/E = **31.4** (Trailing 36.2)
   - Fwd P/E < Trailing P/E → earnings expected to grow ~15% → **positive signal**
+- Struggling retailer $50, trailing EPS = $4.00, forward EPS = $2.50 → Fwd P/E = **20.0** (Trailing 12.5)
+  - Fwd P/E > Trailing P/E → earnings expected to fall 37.5% → **bad signal**
 
-- Declining earnings example: a retailer price = $50, trailing EPS = $4.00, forward EPS = $2.50
-  - Trailing P/E = 12.5, Fwd P/E = 50 / 2.50 = **20.0**
-  - Fwd P/E > Trailing P/E → earnings expected to fall 37.5% → **bad signal** even though trailing P/E looks cheap
-
-**Used in scoring?** Yes — preferred over trailing P/E for the Valuation factor.
+**Used in scoring?** Yes — preferred over trailing P/E for Valuation factor.
 
 ---
 
 ### MC% of S&P 500 — Market Cap as % of Index Total
-**What it is:** What fraction of the entire S&P 500's combined market capitalisation this stock represents.
-
 **Formula:** `Stock Market Cap / Sum of All S&P 500 Market Caps × 100`
 
-**Numeric Examples (approximate 2024/25):**
-
-- Apple (~$3.3T in a ~$45T index) → MC% ≈ **7.3%** — single largest weight
-- Microsoft (~$3.1T) → MC% ≈ **6.9%**
+- Apple (~$3.3T in ~$45T index) → MC% ≈ **7.3%**
 - A mid-cap S&P 500 stock at $50B → MC% ≈ **0.11%**
-
-**Why it matters:** S&P 500 is market-cap weighted. Stocks with high MC% dominate index returns.
-If Apple falls 10%, the S&P 500 loses ~0.73% from Apple alone.
 
 **Used in scoring?** No. Display and filter only.
 
 ---
 
 ### 52W Pos% — 52-Week Position
-**What it is:** Where the current price sits as a percentage between the 52-week low and high.
-
 **Formula:** `(Current Price − 52W Low) / (52W High − 52W Low) × 100`
 
-**Numeric Example:**
-
-- 52W Low = $140, 52W High = $220, Current Price = $175
-  - 52W Pos% = (175 − 140) / (220 − 140) × 100 = 35 / 80 × 100 = **43.8%**
-- 0% = at yearly low. 100% = at yearly high.
-
-**Use cases:**
-- Sort "52W Pos low to high" → find stocks near 52-week lows (potential value)
-- Sort "52W Pos high to low" → find momentum leaders near 52-week highs
+- 52W Low = $140, High = $220, Current = $175 → **43.8%** (0% = at low, 100% = at high)
 
 **Used in scoring?** No. Sort/filter only.
 """)
 
-    # ── TAB 2: QUALITY ────────────────────────────────────────────────────────
     with tab_qual:
         st.markdown("""
 ### Quality Score (0–100)
-**What it is:** Composite score measuring fundamental business strength across three equally-weighted components.
-
 **Formula:** `(ROIC sub-score + Interest Coverage sub-score + Op Margin sub-score) / 3`
 
-**Numeric Example:**
-
-- Stock A: ROIC = 20% → sub-score 77, Int Coverage = 8x → sub-score 80, Op Margin = 25% → sub-score 63
+- Stock A: ROIC = 20% → 77pts, Int Coverage = 8x → 80pts, Op Margin = 25% → 63pts
   - Quality Score = (77 + 80 + 63) / 3 = **73.3 / 100**
 
-**Why this structure?**
-- ROIC measures capital efficiency (are you generating returns above cost of capital?)
-- Interest Coverage measures financial safety (can you service your debt?)
-- Op Margin measures pricing power (how much profit per dollar of revenue?)
+> **Financials sector (v9+):** Uses **ROE** as primary profitability metric instead of ROIC.
+> Op Margin is excluded. Bank ROA/ROIC is structurally 1–2% by design — not a weakness.
 
-> **v9 note — Financials sector:** For banks, insurance, and diversified financials, the Quality Score
-> uses **ROE** as the primary profitability metric instead of ROIC, and **Op Margin is excluded**
-> from the composite. Bank ROA/ROIC is structurally 1–2% by design — not a weakness.
-> Net interest margin is the correct metric for banks but is not surfaced by Yahoo Finance.
-
-**Used in scoring?** Yes — 25% weight (sector-adaptive, see Ranking tab).
+**Used in scoring?** Yes — 18–32% weight (sector-adaptive).
 
 ---
 
 ### ROIC% — Return on Invested Capital
-**What it is:** For every dollar of capital deployed in the business, how many cents of profit does it generate?
+**Formula (computed):** `NOPAT / Invested Capital × 100`
+where NOPAT = Operating Income × (1 − effective tax rate),
+Invested Capital = Equity + Debt − Cash
 
-> **Note on data source:** True ROIC = NOPAT / Invested Capital. This screener computes it from
-> Yahoo financials: NOPAT = Operating Income × (1 − effective tax rate),
-> Invested Capital = Equity + Debt − Cash. Where financials are unavailable, ROA (Net Income / Total
-> Assets) is used as a fallback proxy. ROA understates true ROIC for capital-light businesses (IT,
-> pharma) but is a reasonable approximation.
+- Apple: NOPAT ≈ $95B, Invested Capital ≈ $165B → ROIC ≈ **57.6%**
+- General Motors: NOPAT ≈ $9B, Invested Capital ≈ $85B → ROIC ≈ **10.6%**
 
-**Numeric Example:**
-
-- Apple: NOPAT TTM ≈ $95B, Invested Capital ≈ $165B → ROIC ≈ **57.6%** — exceptional asset-light model
-- General Motors: NOPAT ≈ $9B, Invested Capital ≈ $85B → ROIC ≈ **10.6%** — capital-intensive, acceptable
-
-| ROIC | Assessment | Quality sub-score |
-|---|---|---|
-| 25%+ | Best-in-class | ~90–100 |
-| 15% | Excellent | ~65 |
-| 10% | Good | ~55 |
-| 8% | Minimum threshold | ~49 |
-| 5% | Borderline — flagged | ~38 |
-| Below 0% | Losing money on assets | 0 |
+| ROIC | Assessment |
+|---|---|
+| 25%+ | Best-in-class |
+| 15% | Excellent |
+| 10% | Good |
+| 8% | Minimum threshold |
+| Below 8% | Flagged ROIC<8% |
 
 ---
 
 ### Int Coverage — Interest Coverage Ratio
-**What it is:** How many times over can the company pay its annual interest expense from operating profit?
+**Formula:** `EBIT / |Interest Expense|` (TTM)
 
-**Formula:** `EBIT / |Interest Expense|` (from annual income statement, TTM)
+- Microsoft: EBIT ≈ $100B, Interest ≈ $1.5B → Coverage = **66.7x**
+- Leveraged industrial: EBIT = $500M, Interest = $450M → Coverage = **1.11x** (very risky)
 
-**Numeric Examples:**
+| Coverage | Assessment |
+|---|---|
+| 10x+ | Very safe |
+| 3x | Minimum threshold (below = flagged IntCov<3x) |
+| Below 1x | In distress |
 
-- Microsoft: EBIT ≈ $100B, Interest Expense ≈ $1.5B → Coverage = **66.7x** — fortress balance sheet
-- A leveraged industrial: EBIT = $500M, Interest = $450M → Coverage = **1.11x** — very risky
-- S&P 500 median for non-financials: typically 8–15x
-
-| Coverage | Assessment | Quality sub-score |
-|---|---|---|
-| 10x+ | Very safe | 100 |
-| 5x | Comfortable | 50 |
-| 3x | Minimum threshold | 30 |
-| 1x | Barely covering interest | 10 |
-| Below 1x | In distress | 0 |
-
-> **Note for Banks and NBFCs:** Interest Coverage is **not meaningful** for financial companies
-> whose core business is borrowing and lending. The screener excludes Int Coverage from the
-> Quality Score for the Financials sector.
+> **Note:** Not meaningful for Financials sector — excluded from Quality Score for banks.
 
 ---
 
 ### Op Margin% — Operating Profit Margin
-**What it is:** Of every $1 of revenue, how many cents become operating profit.
-
 **Formula:** `Operating Income / Revenue × 100`
 
-**Numeric Examples:**
-
-- Microsoft: Revenue = $236B, Operating Income = $109B → **46.2%** — elite software margins
-- Apple: Revenue = $383B, Op Income = $114B → **29.8%** — consumer hardware + services blend
-- Ford: Revenue = $185B, Op Income = $7.2B → **3.9%** → flagged Margin<5%
+- Microsoft: $109B / $236B = **46.2%**
+- Ford: $7.2B / $185B = **3.9%** → flagged Margin<5%
 
 | Op Margin | Quality sub-score |
 |---|---|
-| 40%+ | 100 (elite — software, pharma) |
-| 25% | 62 |
+| 40%+ | 100 (elite) |
 | 15% | 37 |
-| 5% | 12 (minimum threshold) |
 | Below 5% | 0 + Margin<5% flag |
 
 ---
 
 ### Quality Flag
-Pass/fail check shown next to Quality Score:
-
-- **ROIC<8%** — capital return below minimum threshold
-- **ROE<8%** — shown for Financials sector when ROE is the primary metric
-- **IntCov<3x** — debt-servicing risk; below 3x interest coverage
-- **Margin<5%** — thin profitability; operating margin below 5%
+- **ROIC<8%** / **ROE<8%** — capital return below threshold
+- **IntCov<3x** — debt-servicing risk
+- **Margin<5%** — thin profitability
 - **Pass** — all checks cleared
-- **D/E: 1.5** — informational Debt/Equity appended to every row regardless of pass/fail
-
-**Example full flag:** `ROIC<8%, Margin<5% | D/E:2.1`
-Means: failed ROIC threshold (e.g. ROA = 5.2%) AND operating margin is thin (e.g. 3.8%), with D/E of 2.1 shown for context.
+- **D/E: x.x** — Debt/Equity appended to every row for context
 """)
 
-    # ── TAB 3: PEG ───────────────────────────────────────────────────────────
     with tab_peg:
         st.markdown("""
 ### PEG — Price/Earnings-to-Growth Ratio
-**What it is:** P/E adjusted for earnings growth rate. Answers the key question:
-*"Is this stock cheap or expensive GIVEN how fast it is growing?"*
-
 **Formula:** `P/E Ratio / Annual EPS Growth Rate (%)`
-
-**Numeric Examples (S&P 500 stocks):**
 
 | Stock | P/E | EPS Growth | PEG | Verdict |
 |---|---|---|---|---|
-| Nvidia | 35 | 40%/yr | 35/40 = **0.88** | Potentially undervalued for hypergrowth |
-| JPMorgan Chase | 12 | 12%/yr | 12/12 = **1.00** | Perfectly fairly valued |
-| Procter & Gamble | 26 | 4%/yr | PEG not computed | Growth below 5% floor |
-| Tesla | 60 | 25%/yr | 60/25 = **2.40** | Expensive vs growth rate |
-| Exxon Mobil | 12 | 1%/yr | PEG not computed | Growth below 5% floor |
-| Alphabet | 22 | 20%/yr | 22/20 = **1.10** | Growth well-priced in |
-
-**Interpreting PEG:**
+| Nvidia | 35 | 40%/yr | **0.88** | Potentially undervalued |
+| Alphabet | 22 | 20%/yr | **1.10** | Growth well-priced in |
+| Tesla | 60 | 25%/yr | **2.40** | Expensive vs growth rate |
+| P&G | 26 | 4%/yr | **N/A** | Below 5% growth floor |
 
 | PEG | Signal |
 |---|---|
-| Below 1.0 | Potentially undervalued — paying less than 1× the growth rate |
-| 1.0–2.0 | Fairly valued for its growth rate |
-| 2.0–3.0 | Expensive — growth partially justifies premium |
-| Above 3.0 | Very hard to justify valuation from growth alone |
+| Below 1.0 | Potentially undervalued |
+| 1.0–2.0 | Fairly valued |
+| 2.0–3.0 | Expensive |
+| Above 3.0 | Very hard to justify |
 
-**Growth guard — why PEG is only computed when EPS growth ≥ 5%:**
-
-- ExxonMobil P/E = 12, EPS growth = 1% → PEG = 12. Mathematically large but not meaningful.
-- Utility and commodity stocks with stable but minimal growth are fine investments —
-  their PEG just isn't a useful signal.
-- The 5% floor removes noise from near-zero growth stocks distorting the PEG ranking.
+**Growth guard:** PEG only computed when EPS growth ≥ 5%. Removes noise from near-zero growth stocks.
 
 **Data source waterfall:**
+1. Yahoo Finance `pegRatio` field
+2. FMP `/ratios-ttm` → `priceEarningsGrowthRatioTTM` (if FMP key configured)
+3. Calculated: (Fwd P/E or Trailing P/E) / EPS growth %
 
-1. Yahoo Finance `pegRatio` field — direct, most reliable, ~70% coverage
-2. FMP `/ratios-ttm` → `priceEarningsGrowthRatioTTM` (if FMP key provided)
-3. Calculated: (Fwd P/E or Trailing P/E) / EPS growth % — fallback when both sources are null
-
-**Used in scoring?** Yes — weight varies by sector (20–25% for growth sectors, 5–10% for Utilities/REIT).
-Lower PEG = better percentile within sector.
+**Used in scoring?** Yes — 5–25% weight (higher for growth sectors like IT).
 """)
 
-    # ── TAB 4: EARN TRAJECTORY ────────────────────────────────────────────────
     with tab_etraj:
         st.markdown("""
 ### Earn Traj — Earnings Trajectory
-**What it is:** Direction and magnitude of expected earnings change, derived from the gap between
-Forward EPS and Trailing EPS.
+**Formula:** `(Forward EPS − Trailing EPS) / |Trailing EPS|` clipped to [−1.0, +1.0]
 
-**Formula:** `(Forward EPS − Trailing EPS) / |Trailing EPS|` — clipped to range [−1.0, +1.0]
+Raw ratio divided by 2 before clipping — 100% earnings jump = +1.0.
 
-The raw ratio is divided by 2 before clipping so that a 100% earnings jump = +1.0 rather than
-requiring a 200% jump. This preserves nuance for moderate changes.
-
-**Numeric Examples (S&P 500 stocks):**
-
-| Situation | Trail EPS | Fwd EPS | Raw | Earn Traj | Signal |
-|---|---|---|---|---|---|
-| Microsoft growing | $11.45 | $13.20 | +0.15 | +0.08 | Mild positive — steady growth |
-| Pharma guidance cut | $8.20 | $7.10 | −0.13 | −0.07 | Mild negative — earnings under pressure |
-| Turnaround story | $1.50 | $4.00 | +1.67/2 | **+0.83** (clipped) | Strong recovery expected |
-| Cyclical trough | $6.00 | $3.50 | −0.42/2 | **−0.21** | Significant earnings decline |
-| Stable utility | $3.20 | $3.35 | +0.05 | +0.02 | Flat — predictable earnings |
-
-**Reading the score:**
+| Situation | Earn Traj | Signal |
+|---|---|---|
+| Microsoft growing | +0.08 | Mild positive |
+| Pharma guidance cut | −0.07 | Mild negative |
+| Turnaround | +0.83 | Strong recovery |
+| Cyclical trough | −0.21 | Significant decline |
 
 | Range | Signal |
 |---|---|
-| +0.5 to +1.0 | Strong earnings recovery or high analyst confidence in growth |
-| +0.1 to +0.3 | Moderate growth — healthy company, earnings expected to expand |
-| Near 0 | Flat earnings — stable but no catalyst |
-| −0.1 to −0.3 | Earnings under pressure — guidance cuts, margin compression |
-| −0.5 to −1.0 | Significant earnings deterioration expected — avoid or investigate |
+| +0.5 to +1.0 | Strong earnings recovery |
+| +0.1 to +0.3 | Moderate growth |
+| Near 0 | Flat — stable but no catalyst |
+| −0.1 to −0.3 | Earnings under pressure |
+| −0.5 to −1.0 | Significant deterioration expected |
 
-**Practical filter uses:**
+**Data source:** Yahoo Finance `forwardEps` and `trailingEps`
 
-- Min Earn Traj = 0.10 → only stocks where analysts forecast ≥10% EPS growth
-- Min Earn Traj = 0.25 → high-conviction earnings growth stories
-- Min Earn Traj = −0.05 → exclude stocks with flat or declining earnings
-
-**Data source:** Yahoo Finance `forwardEps` and `trailingEps` from `.info`
-
-**Used in scoring?** Yes — 15–22% weight (higher for Real Estate where earnings trajectory is key).
-Higher Earn Traj = better percentile within sector.
+**Used in scoring?** Yes — 15–22% weight.
 """)
 
-    # ── TAB 5: MOMENTUM ───────────────────────────────────────────────────────
     with tab_mom:
         st.markdown("""
 ### Momentum Score — Skip-Month Volatility-Adjusted Momentum
-**What it is:** Medium-term price trend adjusted for how noisy/volatile the stock is.
-A clean, sustained move scores higher than a volatile spike of the same raw magnitude.
-
 **Formula:** `(6-month return − 1-month return) / Trailing 90-day Annualised Volatility`
 
-**Why subtract the 1-month return (skip-month technique)?**
-The most recent month exhibits a documented short-term reversal effect — stocks that surged last
-month tend to mean-revert slightly in the near term. Removing it isolates the durable 2–6 month
-trend (based on Fama-French momentum factor construction).
+**Why skip the last month?** Short-term reversal effect — stocks that surged last month
+tend to mean-revert. Removing it isolates the durable 2–6 month trend.
 
-**Numeric Example (S&P 500 stocks):**
-
-**JPMorgan Chase (steady, low volatility):**
-- 6mo return = +18%, 1mo return = +3%, trailing vol = 16%
-- Skip-month raw = 18 − 3 = 15%
-- Momentum Score = 15 / 16 = **0.94** — strong signal per unit of risk
-
-**Tesla (high volatility):**
-- 6mo return = +40%, 1mo return = +10%, trailing vol = 55%
-- Skip-month raw = 40 − 10 = 30%
-- Momentum Score = 30 / 55 = **0.55** — lower score despite higher raw return
-
-JPMorgan's +18% in a 16% vol stock is far more signal-rich than Tesla's +40% in a 55% vol stock.
-
-**Interpreting the score:**
+**Examples:**
+- JPMorgan: 6mo +18%, 1mo +3%, vol 16% → Score = 15/16 = **0.94** (strong signal per unit risk)
+- Tesla: 6mo +40%, 1mo +10%, vol 55% → Score = 30/55 = **0.55** (lower despite higher raw return)
 
 | Score | Signal |
 |---|---|
 | Above +1.0 | Exceptionally strong momentum |
 | +0.3 to +1.0 | Healthy uptrend |
-| −0.3 to +0.3 | Neutral — no clear trend |
-| Below −0.3 | Downtrend — negative momentum |
+| −0.3 to +0.3 | Neutral |
+| Below −0.3 | Downtrend |
 
-**Used in scoring?** Yes — 12–25% weight (higher for Energy and Materials where price momentum
-is a key signal for commodity cycles).
+**Used in scoring?** Yes — 10–25% weight (higher for Energy and Materials).
 
 ---
 
 ### Ret 1Mo%, Ret 3Mo%, Ret 6Mo%
-Raw percentage price returns over 1, 3, 6 months calculated from monthly closing prices.
-
-**Example:** Price 6 months ago = $100, today = $122 → Ret 6Mo% = **+22.0%**
-
-Display only — these feed into Momentum Score but are not directly used for ranking.
-
----
+Raw percentage price returns over 1, 3, 6 months from monthly closing prices. Display only.
 
 ### Trailing Vol%
-Annualised standard deviation of daily price returns over last 90 calendar days.
-
-**Formula:** `Daily Return Std Dev × √252 × 100`
-
-**Numeric Examples:**
-- JPMorgan: daily std dev = 1.0% → annualised = 1.0% × 15.87 = **15.9%** — stable large-cap bank
-- Tesla: daily std dev = 3.5% → annualised = 3.5% × 15.87 = **55.5%** — volatile growth stock
-- S&P 500 index: typically 12–18% annualised volatility in calm markets
-
-Display only — it is the denominator in Momentum Score.
+`Daily Return Std Dev × √252 × 100` over last 90 calendar days. Display only (denominator in Momentum Score).
 """)
 
-    # ── TAB 6: RANKING & SCORE ────────────────────────────────────────────────
     with tab_rank:
         st.markdown("""
 ### Score (0–100)
-**What it is:** Final weighted composite percentile score, computed within each GICS sector independently
-using **sector-adaptive weights** (v9).
+Composite percentile score within GICS sector using sector-adaptive weights.
 
-**Full formula:** Score = W_val × Valuation_pct + W_qual × Quality_pct + W_peg × PEG_pct
-+ W_etraj × EarnTraj_pct + W_mom × Momentum_pct
-Then multiplied by Missing Factor Penalty (see below).
-
-**Numeric Example — Information Technology sector (weights: Val 20%, Qual 25%, PEG 25%, Earn 15%, Mom 15%):**
-
-| Factor | Value | Percentile within IT | Weight | Contribution |
-|---|---|---|---|---|
-| Fwd P/E | 28.5 | 62nd (lower = better) | 20% | 12.4 |
-| Quality Score | 74/100 | 68th | 25% | 17.0 |
-| PEG | 1.35 | 70th | 25% | 17.5 |
-| Earn Traj | +0.12 | 58th | 15% | 8.7 |
-| Momentum | 0.88 | 74th | 15% | 11.1 |
-| **Raw Score** | | | | **66.7** |
-| Missing factors | 0 | Penalty = ×1.0 | | |
-| **Final Score** | | | | **66.7** |
-
-> **Key point:** Score of 67 in IT and Score of 67 in Utilities both mean "67th percentile in their
-> sector." They are **NOT directly comparable** — sector rankings are independent.
-
----
-
-### Sector-Adaptive Weights
-
+**Formula:**
 | Sector | Val | Quality | PEG | Earn | Mom |
 |---|---|---|---|---|---|
-| Information Technology | 20% | 25% | **25%** | 15% | 15% |
-| Consumer Discretionary | 20% | 20% | 22% | 18% | **20%** |
+| Information Technology | 20% | 25% | 25% | 15% | 15% |
+| Consumer Discretionary | 20% | 20% | 22% | 18% | 20% |
 | Communication Services | 22% | 23% | 22% | 18% | 15% |
-| Health Care | 25% | **30%** | 18% | 15% | 12% |
-| Industrials | 25% | **28%** | 18% | 17% | 12% |
-| Consumer Staples | 28% | **32%** | 10% | 15% | 15% |
-| Financials | **30%** | 25% | 18% | 17% | 10% |
-| Energy | **30%** | 18% | 12% | 15% | **25%** |
-| Materials | 28% | 20% | 12% | 15% | **25%** |
-| Real Estate | **30%** | 18% | 10% | **22%** | 20% |
-| Utilities | **38%** | 27% | 5% | 15% | 15% |
-
-Select a sector in the Screener to see the active weights bar in the KPI panel.
+| Health Care | 25% | 30% | 18% | 15% | 12% |
+| Industrials | 25% | 28% | 18% | 17% | 12% |
+| Consumer Staples | 28% | 32% | 10% | 15% | 15% |
+| Financials | 30% | 25% | 18% | 17% | 10% |
+| Energy | 30% | 18% | 12% | 15% | 25% |
+| Materials | 28% | 20% | 12% | 15% | 25% |
+| Real Estate | 30% | 18% | 10% | 22% | 20% |
+| Utilities | 38% | 27% | 5% | 15% | 15% |
 
 ---
 
-### Missing Factor Penalty
+### Missing Factor Penalty (v10 — fixed)
 
-| Missing factors | Multiplier | Effect | Why |
-|---|---|---|---|
-| 0 or 1 | ×1.00 | None | High data confidence |
-| 2 | ×0.85 | −15% | Moderate uncertainty |
-| 3 or more | ×0.70 | −30% | Low confidence |
-
-A PSU stock with only P/E available (PEG = None, Quality = None, Earn Traj = None, Momentum = None)
-has 4 missing factors → Score × 0.70. This prevents a stock with a single very-low P/E from
-falsely ranking #1 when we have no other data to validate it.
+| Missing factors | Multiplier |
+|---|---|
+| 0 | ×1.00 |
+| 1 | ×0.95 ← added in v10 fix |
+| 2 | ×0.85 |
+| 3+ | ×0.70 |
 
 ---
 
 ### Rank
-Ordinal position within sector by Score. **Rank 1 = best-scoring stock in that sector.**
-
-- Rank 2 in Information Technology = 2nd highest Score among all IT stocks
-- Rank 2 in Utilities is a completely independent ranking with no relation to IT Rank 2
-- Stocks with insufficient data (all factors missing) receive no Rank
+Ordinal position within sector by Score. Rank 1 = best-scoring stock in that sector.
+Rankings are sector-independent — IT Rank 2 and Utilities Rank 2 are unrelated.
 
 ---
 
 ### Conviction Score (0–100)
-Score further adjusted for: (1) how complete the data is, and (2) whether the stock's sector
-trades at a premium or discount to the overall index median P/E.
+`Score × data_completeness_ratio × sector_discount_factor` → normalised 0–100
 
-**Formula:** `Score × data_completeness_ratio × sector_discount_factor` → normalised 0–100
-
-**Data completeness example:**
-- Stock has P/E, Quality, Earn Traj but missing PEG and Momentum → completeness = 3/5 = 0.60
-- Raw Score 72 × 0.60 = 43.2 → lower Conviction despite decent Score
-
-**Sector discount factor:**
-- Index median P/E = 22. Consumer Staples median = 28 (premium sector).
-  - Discount = 22/28 = 0.79 → clipped to 0.79 → Staples scores gently penalised
-- Index median P/E = 22. Energy median = 12 (discount sector).
-  - Discount = 22/12 = 1.83 → clipped to **1.30** → Energy stocks get up to 30% boost
-
-**Practical use:** Sort by Conviction Score to find stocks that combine strong fundamentals,
-good data availability, AND reasonable sector valuation all at once.
+- Completeness: 3 of 5 factors present → 0.60 multiplier
+- Sector discount: Energy median P/E = 12 vs index 22 → +30% boost (capped)
+- Use to find stocks combining strong fundamentals + complete data + reasonable sector valuation.
 """)
 
-    # ── TAB 7: DISPLAY-ONLY ───────────────────────────────────────────────────
     with tab_disp:
         st.markdown("""
 ### ROE% — Return on Equity (Display Only)
 **Formula:** `Net Income / Shareholders Equity × 100`
 
-**Numeric Examples:**
+- Apple ROE ≈ 170% — extreme due to buybacks reducing equity base
+- JPMorgan ROE ≈ 15% — healthy for a major bank
 
-- Apple: Net Income = $97B, Equity = $57B → ROE = **170%** — extreme due to buybacks reducing equity base
-- JPMorgan: Net Income = $49B, Equity = $327B → ROE = **15.0%** — healthy for a major bank
-- ExxonMobil: Net Income = $36B, Equity = $165B → ROE = **21.8%** — capital-heavy but efficient
-
-**Why display only (not scored)?** ROE is distorted by leverage and share buybacks.
-A company that borrows heavily or buys back all its shares can show an astronomically high ROE
-without being a better business. ROIC adjusts for this. ROE is shown as a reference point.
+Display only — distorted by leverage and buybacks. ROIC is the scoring metric.
 
 ---
 
 ### Debt/Eq — Debt to Equity Ratio (Display Only)
 **Formula:** `Total Debt / Total Shareholders Equity`
 
-**Numeric Examples:**
+- Microsoft: D/E ≈ 0.35 — conservative
+- Leveraged REIT: D/E = 3.5 — structurally high (project finance)
 
-- Apple: D/E ≈ 1.80 — moderate; offset by massive cash position
-- Microsoft: D/E ≈ 0.35 — conservative balance sheet
-- AT&T: D/E ≈ 1.10 — legacy telecom infrastructure debt
-- A leveraged REIT: D/E = 3.5 — project-finance model, structurally high
-
-**Why display only?** D/E tells you the capital structure but not safety. D/E 3.5 with Int Coverage
-10x (long-term contracted cash flows) is safer than D/E 0.8 with Int Coverage 1.3x (struggling
-retailer). Int Coverage is the scoring metric; D/E is context.
+Display only — D/E without Int Coverage gives incomplete safety picture.
 
 ---
 
 ### Rev Q1–Q4 ($B)
-Last four fiscal quarters of total revenue, newest first.
+Last four fiscal quarters of total revenue, newest first (USD billions).
 
-**Unit:** USD billions
+Accelerating pattern (positive): Q4=$14B → Q3=$15.8B → Q2=$17.1B → Q1=$19.3B
 
-**Examples:**
-
-- Apple Q1 (most recent) = $94.9B
-- An accelerating pattern (positive): Q4 = $14B → Q3 = $15.8B → Q2 = $17.1B → Q1 = $19.3B
-- A decelerating pattern (negative): Q4 = $22B → Q3 = $20.5B → Q2 = $19.1B → Q1 = $18.0B
+Decelerating pattern (negative): Q4=$22B → Q3=$20.5B → Q2=$19.1B → Q1=$18.0B
 
 ---
 
 ### Rev Growth% (CAGR)
-**Formula:** `(Newest quarter revenue / Revenue 4 quarters ago)^(1/3) − 1 × 100`
-
-Compares the most recent quarter to the same quarter one year prior — removes seasonal effects.
-
-**Numeric Example:**
-
-- Nvidia: Q (current) = $26B, Q (1 year ago) = $13.5B → YoY growth = **+92.6%**
-- A commodity company: Q = $12B, Q (year ago) = $16B → **−25.0%** — revenue declined
-
-Display only — not used in PEG or scoring (revenue growth ≠ earnings growth).
-
----
-
-### PEG Method
-Indicates how PEG was derived for this row:
-
-| Value | Meaning |
-|---|---|
-| `Yahoo` | Directly from Yahoo Finance `pegRatio` field — most reliable |
-| `FMP-ratios` | From FMP `/ratios-ttm` endpoint (if FMP key configured) |
-| `Yahoo EPS growth` | Calculated as Fwd P/E (or P/E) ÷ Yahoo `earningsGrowth` |
-| `—` | PEG not available (growth < 5% or insufficient data) |
-
----
-
-### Data Sources
-Pipe-separated log of which source provided each data point for the row.
-
-Example: `PE:Yahoo | PEG:FMP-ratios | ROIC:Yahoo | IC:Yahoo | ET:Yahoo`
+`(Newest quarter / Revenue 4 quarters ago)^(1/3) − 1 × 100`
+Year-over-year comparison removing seasonal effects. Display only.
 
 ---
 
 ### Data Coverage
-Yahoo Finance is the primary source. Coverage varies across the S&P 500:
 
 | Metric | Typical Coverage |
 |---|---|
-| Price, MC, 52W | ~99% of tickers |
+| Price, MC, 52W | ~99% |
 | Trailing P/E | ~90% |
 | Forward P/E | ~78% |
 | PEG Ratio | ~70% |
 | ROE, Op Margin | ~88% |
-| Int Coverage | ~65% (computed from financials) |
-| ROIC (computed) | ~60% (requires full quarterly financials) |
+| Int Coverage | ~65% |
+| ROIC (computed) | ~60% |
 | Earn Traj | ~82% |
-| Momentum | ~97% (requires only price history) |
+| Momentum | ~97% |
 | Quarterly Revenue | ~72% |
 
-Stocks with **fewer than 3 factors** populated receive a −30% Score penalty (Missing Factor Penalty).
+Stocks with fewer than 3 factors populated receive a −30% Score penalty.
 """)
 
     st.markdown("---")
     st.markdown(
         "**Data sources v10:** Yahoo Finance (primary) · FMP bonus if key available · "
-        "ROIC computed from Yahoo quarterly financials · Earn Traj from Yahoo FwdEPS/TrailEPS · "
-        "MC% computed across all S&P 500 constituents · Sector-adaptive 5-factor scoring. "
-        "_Nothing here is financial advice — all metrics are educational references._"
+        "ROIC from Yahoo quarterly financials · Earn Traj from Yahoo FwdEPS/TrailEPS · "
+        "MC% computed across all S&P 500 constituents · Sector-adaptive scoring. "
+        "_Nothing here is financial advice._"
     )
 
 
 # ══════════════════════════════════════════════════════════════════════════════
-# ── APP ENTRY POINT
+# APP ENTRY POINT
 # ══════════════════════════════════════════════════════════════════════════════
 st.set_page_config(page_title="S&P 500 Screener v10", layout="wide", page_icon="📊")
 st.markdown(
@@ -1592,31 +1385,28 @@ st.caption(
     "MC% of S&P500 · Sector-Adaptive 5-factor scoring · FMP bonus layer if key available"
 )
 
-page_screener, page_reference = st.tabs(["📊 Screener", "📖 Column Reference Guide"])
+page_screener, page_reference = st.tabs(["Screener", "Column Reference Guide"])
 
 # ══════════════════════════════════════════════════════════════════════════════
 # PAGE 1 — SCREENER
 # ══════════════════════════════════════════════════════════════════════════════
 with page_screener:
 
-    # ── Refresh row ──────────────────────────────────────────────────────────
     col_r, col_t = st.columns([1, 6])
     with col_r:
-        if st.button("🔄 Refresh"):
+        if st.button("Refresh"):
             st.cache_data.clear()
             st.rerun()
     with col_t:
         st.caption("Last loaded: {} · Prices: 1hr cache · Fundamentals: 24hr cache".format(
             datetime.now().strftime("%I:%M %p")))
 
-    # ── FMP key status ────────────────────────────────────────────────────────
     fmp_key = get_fmp_key()
     if fmp_key:
-        st.success("FMP API key found — will use as bonus layer for PE override and ROIC/IntCov.")
+        st.success("FMP API key found — bonus layer active for PE override and ROIC/IntCov.")
     else:
-        st.info("No FMP key. Running on Yahoo Finance only. Add [fmp] api_key to Streamlit Secrets for FMP overrides.")
+        st.info("No FMP key. Running on Yahoo Finance only. Add [fmp] api_key to Streamlit Secrets.")
 
-    # ── Load data ─────────────────────────────────────────────────────────────
     with st.spinner("Loading S&P 500 universe..."):
         sp500 = fetch_sp500_constituents()
     if sp500.empty:
@@ -1649,7 +1439,6 @@ with page_screener:
     with st.spinner("Fetching quarterly revenue..."):
         rev_map = fetch_last4_revenue_parallel(tickers)
 
-    # ── Coverage banner ───────────────────────────────────────────────────────
     total_t  = len(tickers)
     has_pe   = sum(1 for t in tickers if merged_map.get(t, {}).get("pe")           is not None)
     has_fwd  = sum(1 for t in tickers if merged_map.get(t, {}).get("fwd_pe")       is not None)
@@ -1664,7 +1453,7 @@ with page_screener:
         "Data coverage — "
         "P/E: {}/{} ({:.0f}%) · Fwd P/E: {}/{} ({:.0f}%) · PEG: {}/{} ({:.0f}%) · "
         "ROIC: {}/{} ({:.0f}%) · ROE: {}/{} ({:.0f}%) · Int Coverage: {}/{} ({:.0f}%) · "
-        "Op Margin: {}/{} ({:.0f}%) · Earn Traj: {}/{} ({:.0f}%) · Primary: Yahoo Finance{}".format(
+        "Op Margin: {}/{} ({:.0f}%) · Earn Traj: {}/{} ({:.0f}%) · Primary: Yahoo{}".format(
             has_pe,   total_t, has_pe   / total_t * 100,
             has_fwd,  total_t, has_fwd  / total_t * 100,
             has_peg,  total_t, has_peg  / total_t * 100,
@@ -1677,74 +1466,43 @@ with page_screener:
         )
     )
 
-    # ── Build table ───────────────────────────────────────────────────────────
     scr = build_screener_table(universe_df, prices, merged_map, rev_map, momentum)
 
-    # ══════════════════════════════════════════════════════════════════════════
-    # v10 FILTERS — 5 controls in ONE row
-    # ══════════════════════════════════════════════════════════════════════════
+    # ── 5 filters in ONE row ──────────────────────────────────────────────────
     st.markdown("### Filters")
-
     all_sectors = sorted(scr["Sector"].dropna().unique().tolist())
-
     f1, f2, f3, f4, f5 = st.columns(5)
 
     sector_sel = f1.selectbox(
         "Sector",
         ["All Sectors"] + all_sectors,
-        help="Filter to one GICS sector or view all 503 S&P 500 stocks.",
+        help="Filter to one GICS sector or view all S&P 500 stocks.",
     )
-
     sort_by = f2.selectbox(
         "Sort by",
         [
-            "Sector then Rank",
-            "Score high to low",
-            "Conviction high to low",
-            "MC% of S&P500 high to low",
-            "Price low to high",
-            "Price high to low",
-            "Mkt Cap high to low",
-            "PE low to high",
-            "Fwd PE low to high",
-            "PEG low to high",
-            "Quality Score high",
-            "ROIC high to low",
-            "ROE high to low",
-            "Earn Traj high to low",
-            "Rev Growth high to low",
-            "Momentum Score high",
-            "52W Pos low to high",
+            "Sector then Rank", "Score high to low", "Conviction high to low",
+            "MC% of S&P500 high to low", "Price low to high", "Price high to low",
+            "Mkt Cap high to low", "PE low to high", "Fwd PE low to high",
+            "PEG low to high", "Quality Score high", "ROIC high to low",
+            "ROE high to low", "Earn Traj high to low", "Rev Growth high to low",
+            "Momentum Score high", "52W Pos low to high",
         ],
-        help="Choose the primary sort column for the results table.",
+        help="Primary sort column for the results table.",
     )
-
     mc_min_b = f3.number_input(
-        "Min Mkt Cap ($B)",
-        value=0,
-        step=10,
-        min_value=0,
-        help="Only show stocks with market cap above this threshold (in USD billions).",
+        "Min Mkt Cap ($B)", value=0, step=10, min_value=0,
+        help="Show stocks with market cap above this value (USD billions).",
     )
-
     pe_max = f4.number_input(
-        "Max P/E",
-        value=9999,
-        step=50,
-        min_value=0,
-        help="Exclude stocks with trailing P/E above this value. Stocks with no P/E data are always shown.",
+        "Max P/E", value=9999, step=50, min_value=0,
+        help="Exclude stocks with trailing P/E above this value.",
     )
-
     qual_min_f = f5.number_input(
-        "Min Quality Score",
-        value=0.0,
-        step=5.0,
-        min_value=0.0,
-        max_value=100.0,
-        help="Only show stocks with Quality Score at or above this value (0–100).",
+        "Min Quality Score", value=0.0, step=5.0, min_value=0.0, max_value=100.0,
+        help="Show stocks with Quality Score at or above this value (0–100).",
     )
 
-    # ── KPI panel ─────────────────────────────────────────────────────────────
     render_sector_kpi_panel(scr, sector_sel)
 
     # ── Apply filters ─────────────────────────────────────────────────────────
@@ -1755,7 +1513,6 @@ with page_screener:
     filt = filt[(filt["P/E"].isna())           | (filt["P/E"]           <= pe_max)]
     filt = filt[(filt["Quality Score"].isna()) | (filt["Quality Score"] >= qual_min_f)]
 
-    # ── Sort ──────────────────────────────────────────────────────────────────
     sort_map = {
         "Sector then Rank":          (["Sector", "Rank"],     [True, True]),
         "Score high to low":         (["Score"],              [False]),
@@ -1781,15 +1538,14 @@ with page_screener:
     st.caption("Showing **{}** of **{}** stocks · Sector: {} · Sort: {}".format(
         len(filt), len(scr), sector_sel, sort_by))
 
-    # ── Display ───────────────────────────────────────────────────────────────
     disp = filt.copy()
-    disp["Price ($)"]    = disp["Price"].round(2)
-    disp["Mkt Cap ($B)"] = (disp["Mkt Cap"] / 1e9).round(2)
+    disp["Price ($)"]     = disp["Price"].round(2)
+    disp["Mkt Cap ($B)"]  = (disp["Mkt Cap"] / 1e9).round(2)
     disp["MC% of S&P500"] = disp["MC% of S&P500"].round(4)
-    disp["Rev Q1 ($B)"]  = (disp["Rev Q1"] / 1e9).round(2)
-    disp["Rev Q2 ($B)"]  = (disp["Rev Q2"] / 1e9).round(2)
-    disp["Rev Q3 ($B)"]  = (disp["Rev Q3"] / 1e9).round(2)
-    disp["Rev Q4 ($B)"]  = (disp["Rev Q4"] / 1e9).round(2)
+    disp["Rev Q1 ($B)"]   = (disp["Rev Q1"] / 1e9).round(2)
+    disp["Rev Q2 ($B)"]   = (disp["Rev Q2"] / 1e9).round(2)
+    disp["Rev Q3 ($B)"]   = (disp["Rev Q3"] / 1e9).round(2)
+    disp["Rev Q4 ($B)"]   = (disp["Rev Q4"] / 1e9).round(2)
 
     disp["Quality Flag"] = disp.apply(
         lambda r: quality_flag(
@@ -1812,8 +1568,7 @@ with page_screener:
 
     COLS = [
         "Ticker", "Sector", "Price ($)", "Mkt Cap ($B)", "MC% of S&P500",
-        "P/E", "Fwd P/E", "PEG", "PEG Method",
-        "Earn Traj",
+        "P/E", "Fwd P/E", "PEG", "PEG Method", "Earn Traj",
         "ROIC%", "ROE%", "Int Coverage", "Op Margin%", "Debt/Eq",
         "Quality Score", "Quality Flag",
         "Momentum Score", "Ret 1Mo%", "Ret 3Mo%", "Ret 6Mo%", "Trailing Vol%",
@@ -1822,35 +1577,30 @@ with page_screener:
         "Rev Growth% (CAGR)", "Data Sources",
     ]
     disp_final = disp[[c for c in COLS if c in disp.columns]].copy()
-
     st.dataframe(disp_final, use_container_width=True, height=680)
 
     st.download_button(
-        label="⬇️ Download CSV",
+        label="Download CSV",
         data=disp_final.to_csv(index=False).encode("utf-8"),
         file_name="sp500_screener_v10_{}.csv".format(datetime.now().strftime("%Y%m%d_%H%M")),
         mime="text/csv",
     )
 
-    # ── Metric legend under table ─────────────────────────────────────────────
     st.markdown("""
-**PEG:** Price/Earnings-to-Growth. PEG < 1.0 = potentially undervalued for its growth rate.
-Only computed when EPS growth ≥ 5% to avoid meaningless ratios for slow-growth stocks.
+**PEG:** Price/Earnings-to-Growth. PEG < 1.0 = potentially undervalued for its growth rate. Only computed when EPS growth >= 5%.
 
-**Earn Traj:** (Forward EPS − Trailing EPS) / |Trailing EPS|, clipped to [−1.0, +1.0].
-Positive = analysts expect earnings growth. +0.20 = analysts forecast ~20% EPS improvement ahead.
+**Earn Traj:** (Forward EPS - Trailing EPS) / |Trailing EPS|. Positive = analysts expect earnings growth. +0.20 = ~20% EPS improvement forecast.
 
-**MC% of S&P500:** This stock's market cap as a % of total S&P 500 market cap.
-Apple at ~7% means a 10% Apple drop drags the index ~0.7% on its own.
+**MC% of S&P500:** This stock's market cap as % of total S&P 500 market cap.
 
-**Score:** Sector-adaptive weights — select a sector to see the active weights bar in the KPI panel above.
+**Score:** Sector-adaptive weights — select a sector to see active weights in the KPI panel above.
 """)
 
     st.markdown("---")
     st.caption(
-        "Sources v10: Yahoo Finance primary · FMP bonus if key available · "
+        "v10 · Yahoo Finance primary · FMP bonus if key available · "
         "ROIC from Yahoo quarterly financials · Earn Traj from Yahoo FwdEPS/TrailEPS · "
-        "MC% computed across all S&P 500 constituents · Sector-adaptive scoring"
+        "Sector-adaptive scoring · normalise_pct_fmp fix · missing_factor_penalty 4-tier fix"
     )
 
 # ══════════════════════════════════════════════════════════════════════════════

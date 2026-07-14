@@ -4,9 +4,11 @@
 #  1. UI CLEAN  — Removed subtitle caption under main heading
 #  2. UI CLEAN  — Removed pre-filter + FMP tier st.caption messages
 #  3. UI CLEAN  — Removed render_sector_kpi_panel() call (sector KPI block)
-#  4. FIX       — Momentum/52W None fix: robust _yf_close for all batch sizes;
-#                 added fallback column name variants; explicit ticker-level
-#                 try/except with column debug guard in momentum fetch
+#  4. FIX       — Momentum/52W/Price None fix: replaced batch yf.download()
+#                 with per-ticker yf.Ticker(t).history() which always returns
+#                 a flat DataFrame (Close, High, Low, Volume) — no MultiIndex
+#                 ambiguity. 52W hi/lo now derived from 12-month daily history.
+#                 Monthly returns resampled from daily history via .resample().
 #  5. UI CLEAN  — Removed "Data Sources" column from display table and COLS
 # ─────────────────────────────────────────────────────────────────────────────
 
@@ -176,48 +178,6 @@ def revenue_growth_pct_cagr(rev4):
         return None
 
 
-# ── v14 fix: robust MultiIndex + flat column accessor for yf.download ─────────
-def _yf_close(raw, ticker, n_tickers):
-    """
-    Safely extract the Close series from a yf.download result.
-
-    yfinance ≥ 0.2.x behaviour:
-      • Multiple tickers  → MultiIndex columns: (field, ticker)
-      • Single ticker     → may be flat ("Close") OR MultiIndex depending on version
-
-    Strategy:
-      1. MultiIndex present  → try raw["Close"][ticker], fallback raw["Close"]
-      2. Flat columns        → try raw["Close"], then raw["Adj Close"]
-      3. All else fails      → return empty Series
-    """
-    try:
-        if isinstance(raw.columns, pd.MultiIndex):
-            # Level 0 = field name, Level 1 = ticker symbol
-            close_df = raw.get("Close", raw.get("Adj Close"))
-            if close_df is None:
-                return pd.Series(dtype=float)
-            if isinstance(close_df, pd.DataFrame):
-                # Multiple tickers in download
-                if ticker in close_df.columns:
-                    return close_df[ticker].dropna()
-                # Ticker not found — try case-insensitive match
-                for col in close_df.columns:
-                    if str(col).upper() == ticker.upper():
-                        return close_df[col].dropna()
-                return pd.Series(dtype=float)
-            else:
-                # Single-ticker MultiIndex collapsed to Series
-                return close_df.dropna()
-        else:
-            # Flat columns (legacy single-ticker download)
-            for field in ("Close", "Adj Close"):
-                if field in raw.columns:
-                    return raw[field].dropna()
-            return pd.Series(dtype=float)
-    except Exception:
-        return pd.Series(dtype=float)
-
-
 # ── S&P 500 universe ──────────────────────────────────────────────────────────
 @st.cache_data(ttl=86400)
 def fetch_sp500_constituents():
@@ -240,118 +200,143 @@ def fetch_sp500_constituents():
     return pd.DataFrame(data)
 
 
-# ── Prices + 52W batch ────────────────────────────────────────────────────────
-@st.cache_data(ttl=3600)
-def fetch_prices_batch(tickers):
-    tl  = list(tickers)
-    res = {t: {"price": None, "hi52": None, "lo52": None, "mc": None} for t in tl}
-    try:
-        raw = yf.download(
-            tl, period="2d", interval="1d",
-            group_by="ticker", auto_adjust=True,
-            progress=False, threads=True,
-        )
-        for t in tl:
-            try:
-                closes = _yf_close(raw, t, len(tl))
-                if not closes.empty:
-                    res[t]["price"] = float(closes.iloc[-1])
-            except Exception:
-                pass
-    except Exception:
-        pass
-    return res
-
-
-# ── Momentum ──────────────────────────────────────────────────────────────────
-@st.cache_data(ttl=3600)
-def fetch_momentum_batch(tickers):
+# ══════════════════════════════════════════════════════════════════════════════
+# PRICES + MOMENTUM — per-ticker yf.Ticker(t).history()
+# v14 FIX: replaced batch yf.download() with per-ticker .history() calls.
+# .history() always returns a flat DataFrame with columns:
+#   Open, High, Low, Close, Volume, Dividends, Stock Splits
+# No MultiIndex, no group_by ambiguity, no version-dependent column shapes.
+# 52W hi/lo derived from 12-month daily history (more reliable than fast_info).
+# Monthly returns resampled from daily Close via .resample("ME").last().
+# ══════════════════════════════════════════════════════════════════════════════
+def _fetch_price_momentum_one(t):
     """
-    v14 fix: Robust momentum fetch.
-    - _yf_close updated to handle all MultiIndex / flat column variants
-    - Per-ticker exception isolation prevents one bad ticker from zeroing others
-    - 52W high/low derived from the 7-month daily download as a bonus fallback
+    Fetch price, 52W hi/lo, momentum returns, and trailing volatility
+    for a single ticker using yf.Ticker(t).history().
+
+    Returns a dict with keys:
+        price, hi52, lo52,
+        ret_1mo, ret_3mo, ret_6mo,
+        trailing_vol, momentum_score
     """
-    tl  = list(tickers)
-    out = {t: {} for t in tl}
-
-    # ── Daily download (7 months) — used for volatility + 52W fallback ────
-    raw_d = None
+    result = {
+        "price":          None,
+        "hi52":           None,
+        "lo52":           None,
+        "ret_1mo":        None,
+        "ret_3mo":        None,
+        "ret_6mo":        None,
+        "trailing_vol":   None,
+        "momentum_score": None,
+    }
     try:
-        raw_d = yf.download(
-            tl, period="7mo", interval="1d",
-            group_by="ticker", auto_adjust=True,
-            progress=False, threads=True,
-        )
+        obj  = yf.Ticker(t)
+        # 12 months of daily history covers both 52W range and 6-month returns
+        hist = obj.history(period="12mo", interval="1d", auto_adjust=True)
+
+        if hist is None or hist.empty:
+            return t, result
+
+        # Ensure Close column exists (auto_adjust uses 'Close' not 'Adj Close')
+        if "Close" not in hist.columns:
+            return t, result
+
+        closes = hist["Close"].dropna()
+        if closes.empty:
+            return t, result
+
+        # ── Current price + 52W range ─────────────────────────────────────
+        result["price"] = float(closes.iloc[-1])
+        result["hi52"]  = float(closes.max())
+        result["lo52"]  = float(closes.min())
+
+        # ── Monthly returns via resampling ────────────────────────────────
+        # Resample daily closes to month-end; need at least 7 bars for 6Mo ret
+        monthly = closes.resample("ME").last().dropna()
+        if len(monthly) < 2:
+            return t, result
+
+        px_now = float(monthly.iloc[-1])
+        if px_now <= 0:
+            return t, result
+
+        def ret_mo(n):
+            # index -(n+1) gives the close n months ago
+            idx = -(n + 1)
+            if abs(idx) > len(monthly):
+                return None
+            px = float(monthly.iloc[idx])
+            return (px_now / px - 1) * 100.0 if px > 0 else None
+
+        r1 = ret_mo(1)
+        r3 = ret_mo(3)
+        r6 = ret_mo(6)
+        result["ret_1mo"] = r1
+        result["ret_3mo"] = r3
+        result["ret_6mo"] = r6
+
+        # ── Trailing 90-day annualised volatility ─────────────────────────
+        if len(closes) >= 20:
+            daily_rets = closes.pct_change().dropna().tail(90)
+            if len(daily_rets) >= 15:
+                result["trailing_vol"] = float(
+                    daily_rets.std() * np.sqrt(252) * 100.0
+                )
+
+        # ── Skip-month momentum (6Mo − 1Mo) / vol ────────────────────────
+        t_vol = result["trailing_vol"]
+        if r6 is not None and r1 is not None:
+            skip_raw = r6 - r1
+            if t_vol and t_vol > 0:
+                result["momentum_score"] = skip_raw / t_vol
+            else:
+                result["momentum_score"] = skip_raw
+
     except Exception:
         pass
 
-    # ── Monthly download (7 months) — used for 1/3/6-month returns ────────
-    raw_m = None
-    try:
-        raw_m = yf.download(
-            tl, period="7mo", interval="1mo",
-            group_by="ticker", auto_adjust=True,
-            progress=False, threads=True,
-        )
-    except Exception:
-        pass
+    return t, result
 
-    if raw_d is None and raw_m is None:
-        return out
 
-    for t in tl:
-        try:
-            closes_m = _yf_close(raw_m, t, len(tl)) if raw_m is not None else pd.Series(dtype=float)
-            closes_d = _yf_close(raw_d, t, len(tl)) if raw_d is not None else pd.Series(dtype=float)
+@st.cache_data(ttl=3600)
+def fetch_price_momentum_all(tickers):
+    """
+    Per-ticker price + momentum fetch using yf.Ticker(t).history().
+    Runs concurrently in chunks. Returns a unified dict keyed by ticker.
+    """
+    tl       = list(tickers)
+    out      = {t: {} for t in tl}
+    CHUNK    = 25
+    WKRS     = 10
+    SLEEP    = 1.0
+    chunks   = [tl[i:i+CHUNK] for i in range(0, len(tl), CHUNK)]
+    total    = len(chunks)
+    progress = st.progress(0)
+    status   = st.empty()
 
-            # Need at least 2 monthly bars for return calculation
-            if len(closes_m) < 2:
-                continue
-
-            px_now = float(closes_m.iloc[-1])
-            if px_now <= 0:
-                continue
-
-            def ret_mo(n):
-                idx = -(n + 1)
-                if abs(idx) > len(closes_m):
-                    return None
-                px = float(closes_m.iloc[idx])
-                return (px_now / px - 1) * 100.0 if px > 0 else None
-
-            r1 = ret_mo(1)
-            r3 = ret_mo(3)
-            r6 = ret_mo(6)
-
-            trailing_vol = None
-            if len(closes_d) >= 20:
-                daily_rets = closes_d.pct_change().dropna().tail(90)
-                if len(daily_rets) >= 15:
-                    trailing_vol = float(
-                        daily_rets.std() * np.sqrt(252) * 100.0
-                    )
-
-            skip_mom_raw = (
-                (r6 - r1) if (r6 is not None and r1 is not None) else None
+    for ci, chunk in enumerate(chunks):
+        status.text(
+            "Prices + Momentum: chunk {}/{} ({} tickers done)...".format(
+                ci + 1, total, ci * CHUNK
             )
-            skip_mom_adj = None
-            if skip_mom_raw is not None and trailing_vol and trailing_vol > 0:
-                skip_mom_adj = skip_mom_raw / trailing_vol
-            elif skip_mom_raw is not None:
-                skip_mom_adj = skip_mom_raw
+        )
+        with concurrent.futures.ThreadPoolExecutor(max_workers=WKRS) as ex:
+            futures = {ex.submit(_fetch_price_momentum_one, t): t for t in chunk}
+            for fut in concurrent.futures.as_completed(
+                futures, timeout=FETCH_TIMEOUT_PER_TICKER * len(chunk)
+            ):
+                try:
+                    t, d = fut.result()
+                    out[t] = d
+                except Exception:
+                    t = futures[fut]
+                    out[t] = {}
+        progress.progress((ci + 1) / total)
+        if ci < len(chunks) - 1:
+            time.sleep(SLEEP + random.uniform(0, 0.3))
 
-            out[t] = {
-                "ret_1mo":        r1,
-                "ret_3mo":        r3,
-                "ret_6mo":        r6,
-                "trailing_vol":   trailing_vol,
-                "momentum_score": skip_mom_adj,
-            }
-        except Exception:
-            # Isolate per-ticker failures — do not propagate
-            pass
-
+    progress.empty()
+    status.empty()
     return out
 
 
@@ -382,11 +367,7 @@ def _fetch_yahoo_info_one(t):
             fi = obj.fast_info
             if fi is not None:
                 mc_fi = sf(getattr(fi, "market_cap", None))
-                hi_fi = sf(getattr(fi, "year_high",  None))
-                lo_fi = sf(getattr(fi, "year_low",   None))
-                if mc_fi: result["mc"]   = mc_fi
-                if hi_fi: result["hi52"] = hi_fi
-                if lo_fi: result["lo52"] = lo_fi
+                if mc_fi: result["mc"] = mc_fi
         except Exception:
             pass
 
@@ -456,14 +437,6 @@ def _fetch_yahoo_info_one(t):
             mc_y = sf(info.get("marketCap"))
             if mc_y:
                 result["mc"] = mc_y
-        if result["hi52"] is None:
-            h52 = sf(info.get("fiftyTwoWeekHigh"))
-            if h52:
-                result["hi52"] = h52
-        if result["lo52"] is None:
-            l52 = sf(info.get("fiftyTwoWeekLow"))
-            if l52:
-                result["lo52"] = l52
 
     except Exception:
         pass
@@ -756,15 +729,11 @@ def fetch_fmp_quotes_if_available(tickers, api_key):
                     continue
                 pe = sf(item.get("pe"))
                 mc = sf(item.get("marketCap"))
-                hi = sf(item.get("yearHigh"))
-                lo = sf(item.get("yearLow"))
                 if pe is not None and (pe <= 0 or pe > 10_000):
                     pe = None
                 out[t] = {
                     "pe":     pe,
                     "mc":     mc,
-                    "hi52":   hi,
-                    "lo52":   lo,
                     "pe_src": "FMP-quote" if pe is not None else None,
                 }
         except Exception:
@@ -789,7 +758,6 @@ def fetch_fmp_ratios_if_available(tickers, api_key):
         r    = requests.get(test_url, timeout=10)
         data = r.json()
         if not isinstance(data, list) or len(data) == 0:
-            st.caption("FMP /ratios-ttm: not available on your tier.")
             return out
         st.session_state["fmp_ratios_fields"] = list(data[0].keys())
     except Exception:
@@ -837,14 +805,14 @@ def fetch_fmp_ratios_if_available(tickers, api_key):
             )
 
             return t, {
-                "peg":          peg,
-                "roic":         roic,
-                "roe":          roe,
-                "op_margin":    om,
-                "int_coverage": ic,
-                "debt_eq":      de,
+                "peg":             peg,
+                "roic":            roic,
+                "roe":             roe,
+                "op_margin":       om,
+                "int_coverage":    ic,
+                "debt_eq":         de,
                 "fmp_trailing_pe": fmp_trailing_pe,
-                "peg_src": "FMP-ratios" if peg else None,
+                "peg_src":         "FMP-ratios" if peg else None,
             }
         except Exception:
             return t, {}
@@ -898,18 +866,16 @@ def merge_all_sources(yahoo_data, fmp_quotes, fmp_ratios, tickers):
             yb.get("peg_src", "Yahoo") if yb.get("peg") is not None else "—"
         )
 
-        roic    = first(fr.get("roic"),         yb.get("roic"))
-        roe     = first(fr.get("roe"),           yb.get("roe"))
-        ic      = first(fr.get("int_coverage"),  yb.get("int_coverage"))
-        om      = first(fr.get("op_margin"),     yb.get("op_margin"))
-        de      = first(fr.get("debt_eq"),       yb.get("debt_eq"))
-        eps_g   = yb.get("eps_growth")
-        g_src   = "Yahoo" if eps_g is not None else None
+        roic      = first(fr.get("roic"),         yb.get("roic"))
+        roe       = first(fr.get("roe"),           yb.get("roe"))
+        ic        = first(fr.get("int_coverage"),  yb.get("int_coverage"))
+        om        = first(fr.get("op_margin"),     yb.get("op_margin"))
+        de        = first(fr.get("debt_eq"),        yb.get("debt_eq"))
+        eps_g     = yb.get("eps_growth")
+        g_src     = "Yahoo" if eps_g is not None else None
         earn_traj = yb.get("earn_traj")
-        mc      = first(fq.get("mc"),   yb.get("mc"))
-        hi52    = first(fq.get("hi52"), yb.get("hi52"))
-        lo52    = first(fq.get("lo52"), yb.get("lo52"))
-        rev4    = yb.get("rev4", [None, None, None, None])
+        mc        = first(fq.get("mc"),  yb.get("mc"))
+        rev4      = yb.get("rev4", [None, None, None, None])
 
         merged[t] = {
             "pe": pe_val, "pe_src": pe_src, "fwd_pe": fwd_pe,
@@ -918,7 +884,7 @@ def merge_all_sources(yahoo_data, fmp_quotes, fmp_ratios, tickers):
             "op_margin": om, "debt_eq": de,
             "eps_growth": eps_g, "growth_src": g_src,
             "earn_traj": earn_traj,
-            "mc": mc, "hi52": hi52, "lo52": lo52,
+            "mc": mc,
             "rev4": rev4,
         }
     return merged
@@ -1067,20 +1033,30 @@ def compute_rank_by_sector(scr):
 
 
 # ── Build screener table ───────────────────────────────────────────────────────
-def build_screener_table(universe_df, prices_map, merged_map, momentum_map):
+def build_screener_table(universe_df, pm_map, merged_map):
+    """
+    v14: pm_map is the unified price+momentum dict from fetch_price_momentum_all().
+    Replaces separate prices_map + momentum_map parameters.
+    """
     rows = []
     for _, r in universe_df.iterrows():
         t   = r["Ticker"]
         sec = r["Sector"]
 
-        px_info   = prices_map.get(t, {})
-        price     = to_num(px_info.get("price"))
+        pm        = pm_map.get(t, {})
+        price     = to_num(pm.get("price"))
+        hi        = to_num(pm.get("hi52"))
+        lo        = to_num(pm.get("lo52"))
+        ret_1mo   = to_num(pm.get("ret_1mo"))
+        ret_3mo   = to_num(pm.get("ret_3mo"))
+        ret_6mo   = to_num(pm.get("ret_6mo"))
+        t_vol     = to_num(pm.get("trailing_vol"))
+        mom_score = to_num(pm.get("momentum_score"))
+
         fi        = merged_map.get(t, {})
         mc        = to_num(fi.get("mc"))
         pe        = to_num(fi.get("pe"))
         fwd       = to_num(fi.get("fwd_pe"))
-        hi        = to_num(fi.get("hi52"))
-        lo        = to_num(fi.get("lo52"))
         roic      = to_num(fi.get("roic"))
         roe       = to_num(fi.get("roe"))
         ic        = to_num(fi.get("int_coverage"))
@@ -1088,6 +1064,7 @@ def build_screener_table(universe_df, prices_map, merged_map, momentum_map):
         de        = to_num(fi.get("debt_eq"))
         earn_traj = to_num(fi.get("earn_traj"))
 
+        # 52W position — derived from history-based hi/lo (more reliable)
         pos52 = None
         if pd.notna(price) and pd.notna(hi) and pd.notna(lo) and hi != lo:
             pos52 = float((price - lo) / (hi - lo) * 100.0)
@@ -1120,13 +1097,6 @@ def build_screener_table(universe_df, prices_map, merged_map, momentum_map):
             float(om)   if pd.notna(om)   else None,
             sector=sec,
         )
-
-        mom       = momentum_map.get(t, {})
-        ret_1mo   = to_num(mom.get("ret_1mo"))
-        ret_3mo   = to_num(mom.get("ret_3mo"))
-        ret_6mo   = to_num(mom.get("ret_6mo"))
-        mom_score = to_num(mom.get("momentum_score"))
-        t_vol     = to_num(mom.get("trailing_vol"))
 
         rows.append({
             "Ticker":             t,
@@ -1184,7 +1154,7 @@ def build_screener_table(universe_df, prices_map, merged_map, momentum_map):
     if "Rank" not in scr.columns:
         scr["Rank"] = pd.NA
 
-    sector_med_pe   = scr.groupby("Sector")["P/E"].transform("median")
+    sector_med_pe        = scr.groupby("Sector")["P/E"].transform("median")
     scr["P/E vs Sector Med"] = (scr["P/E"] / sector_med_pe).round(2)
 
     scr = compute_conviction_scores(scr)
@@ -1230,31 +1200,23 @@ Used in scoring? **Yes** — primary Valuation factor (20–38% weight).
 Formula: `Current Stock Price / Next 12-Month Estimated EPS`
 
 Source: **Yahoo Finance only** (forwardPE / forwardEps fields).
-FMP `priceToEarningsRatioTTM` is trailing P/E — not used for Fwd P/E (v13 fix).
 
 ---
-**P/E vs Sector Med** _(v13 new)_
+**P/E vs Sector Med**
 
 Formula: `Stock P/E / Median P/E of all stocks in same sector`
 
-- 0.80 = 20% cheaper than sector peers → bullish signal
-- 1.20 = 20% more expensive than sector peers → expensive signal
+- 0.80 = 20% cheaper than sector peers
+- 1.20 = 20% more expensive than sector peers
 
 Used in scoring? **No**. Display and context only.
-
----
-**MC% of S&P 500**
-
-Formula: `Stock Market Cap / Sum of All S&P 500 Market Caps × 100`
-
-Used in scoring? **No**. Display and filter only.
 
 ---
 **52W Pos%**
 
 Formula: `(Current Price − 52W Low) / (52W High − 52W Low) × 100`
 
-0% = at 52-week low · 100% = at 52-week high
+Derived from 12-month daily price history. 0% = at low · 100% = at high.
         """)
 
     with tab_qual:
@@ -1267,6 +1229,7 @@ Financials sector: Uses ROE as primary profitability metric. Op Margin excluded.
 
 ---
 **ROIC% — Return on Invested Capital**
+
 NOPAT = Operating Income × (1 − effective tax rate)
 Excess Cash = max(0, Total Cash − 2% of Revenue TTM)
 Invested Capital = Equity + Debt − Excess Cash
@@ -1281,12 +1244,9 @@ ROIC = NOPAT / Invested Capital × 100
 | Below 8% | Flagged ROIC<8% |
 
 ---
-**Quality Flag** _(v13: D/E removed from this column)_
+**Quality Flag**
 
 Flags: `ROIC<8%` · `ROE<8%` · `IntCov<3x` · `Margin<5%` · `Pass`
-
-D/E ratio now shown separately in the **Debt/Eq** column — no longer embedded
-in Quality Flag text, making flag text filterable.
         """)
 
     with tab_peg:
@@ -1303,11 +1263,6 @@ Formula: `P/E Ratio / Annual EPS Growth Rate (%)`
 | P&G | 26 | 4%/yr | N/A | Below 5% growth floor |
 
 Growth guard: PEG only computed when EPS growth ≥ 5%.
-
-Data source waterfall:
-1. Yahoo Finance pegRatio
-2. FMP /ratios-ttm → priceEarningsGrowthRatioTTM
-3. Calculated: (Fwd P/E or Trailing P/E) / EPS growth %
         """)
 
     with tab_etraj:
@@ -1316,7 +1271,7 @@ Data source waterfall:
 
 Formula: `(Forward EPS − Trailing EPS) / |Trailing EPS|` clipped to `[−1.0, +1.0]`
 
-v12 cap: When both EPS values are negative, capped at +0.30 (recovery-in-progress).
+Cap: When both EPS values are negative, capped at +0.30 (recovery-in-progress).
 
 | Scenario | Earn Traj | Interpretation |
 |---|---|---|
@@ -1332,7 +1287,8 @@ v12 cap: When both EPS values are negative, capped at +0.30 (recovery-in-progres
 
 Formula: `(6-month return − 1-month return) / Trailing 90-day Annualised Volatility`
 
-Why skip the last month? Short-term reversal effect — removes noise, isolates the durable 2–6 month trend.
+Returns are derived from 12-month daily price history resampled to month-end closes.
+52W High/Low are also sourced from the same 12-month history.
 
 | Score | Signal |
 |---|---|
@@ -1368,26 +1324,19 @@ Composite percentile score within GICS sector using sector-adaptive weights.
 **Conviction Score (0–100)**
 
 `Score × data_completeness_ratio × sector_discount_factor → normalised 0–100`
-
-v13 fix: Single-stock or uniform-score edge case now correctly returns 50
-instead of causing a Pandas scalar assignment warning.
         """)
 
     with tab_disp:
         st.markdown("""
-**Rev Q1 Oldest ($B) → Rev Q4 Latest ($B)** _(v13: renamed for clarity)_
+**Rev Q1 Oldest ($B) → Rev Q4 Latest ($B)**
 
-Last four fiscal quarters of total revenue, ordered **oldest → newest**.
-Q4 Latest is the most recent quarter available.
-
-v13 improvement: Revenue is now fetched in Phase 2 alongside ROIC/IntCov,
-eliminating ~500 duplicate API calls vs v12.
+Last four fiscal quarters of total revenue, ordered oldest → newest.
 
 **Data Coverage (typical)**
 
 | Metric | Typical Coverage |
 |---|---|
-| Price, MC, 52W | ~99% |
+| Price, 52W Hi/Lo | ~99% |
 | Trailing P/E | ~90% |
 | Forward P/E | ~78% |
 | PEG Ratio | ~70% |
@@ -1395,15 +1344,15 @@ eliminating ~500 duplicate API calls vs v12.
 | Int Coverage | ~65% |
 | ROIC (computed) | ~60% |
 | Earn Traj | ~82% |
-| Momentum | ~97% |
+| Momentum / Returns | ~97% |
 | Quarterly Revenue | ~72% |
         """)
 
     st.markdown("---")
     st.markdown(
         "**Data sources v14:** Yahoo Finance (primary) · FMP bonus if key available · "
-        "ROIC + Revenue from Phase 2 (single quarterly_financials call per ticker) · "
-        "Fwd P/E from Yahoo only (FMP TTM ratio is trailing — v13 fix) · "
+        "Price + Momentum + 52W from per-ticker history() — no MultiIndex issues · "
+        "ROIC + Revenue from Phase 2 · Fwd P/E from Yahoo only · "
         "Earn Traj both-negative cap at +0.30 · Sector-adaptive scoring. "
         "_Nothing here is financial advice._"
     )
@@ -1424,7 +1373,6 @@ st.markdown(
 )
 
 st.markdown("## S&P 500 Fundamental Screener v14")
-# ── v14: subtitle caption removed (change #1) ─────────────────────────────────
 
 page_screener, page_reference = st.tabs(["Screener", "Column Reference Guide"])
 
@@ -1439,7 +1387,7 @@ with page_screener:
             st.rerun()
     with col_t:
         st.caption(
-            "Last loaded: {} · Prices: 1hr cache · Fundamentals: 24hr cache".format(
+            "Last loaded: {} · Prices + Momentum: 1hr cache · Fundamentals: 24hr cache".format(
                 datetime.now().strftime("%I:%M %p")
             )
         )
@@ -1464,8 +1412,7 @@ with page_screener:
 
     universe_df = sp500.copy().reset_index(drop=True)
     tickers     = tuple(universe_df["Ticker"].tolist())
-
-    today_date = date.today()
+    today_date  = date.today()
 
     # ── Filters ────────────────────────────────────────────────────────────
     st.markdown("### Filters")
@@ -1515,7 +1462,6 @@ with page_screener:
     filtered_tickers = _pre_filter_tickers(
         yahoo_info, universe_df, mc_min_b, pe_max
     )
-    # ── v14: pre-filter caption removed (change #2) ────────────────────────
 
     # ── Phase 2 ────────────────────────────────────────────────────────────
     with st.spinner(
@@ -1530,12 +1476,13 @@ with page_screener:
     # ── Merge Phase 1 + Phase 2 ────────────────────────────────────────────
     yahoo_fundamentals = merge_yahoo_phases(yahoo_info, yahoo_deep, tickers)
 
-    # ── Prices + Momentum ──────────────────────────────────────────────────
-    with st.spinner("Fetching prices ({} tickers)...".format(len(tickers))):
-        prices = fetch_prices_batch(tickers)
-
-    with st.spinner("Fetching momentum (skip-month vol-adjusted)..."):
-        momentum = fetch_momentum_batch(tickers)
+    # ── Price + Momentum (per-ticker history — v14 fix) ────────────────────
+    with st.spinner(
+        "Fetching prices + momentum for {} tickers (per-ticker history)...".format(
+            len(tickers)
+        )
+    ):
+        pm_data = fetch_price_momentum_all(tickers)
 
     # ── FMP bonus layer ────────────────────────────────────────────────────
     fmp_quotes = {}
@@ -1546,7 +1493,7 @@ with page_screener:
         with st.spinner("FMP bonus: /ratios-ttm..."):
             fmp_ratios = fetch_fmp_ratios_if_available(tickers, fmp_key)
 
-    # ── Merge all sources ──────────────────────────────────────────────────
+    # ── Merge all fundamental sources ──────────────────────────────────────
     with st.spinner("Merging data sources..."):
         merged_map = merge_all_sources(
             yahoo_fundamentals, fmp_quotes, fmp_ratios, tickers
@@ -1562,6 +1509,7 @@ with page_screener:
     has_ic   = sum(1 for t in tickers if merged_map.get(t, {}).get("int_coverage") is not None)
     has_om   = sum(1 for t in tickers if merged_map.get(t, {}).get("op_margin")    is not None)
     has_et   = sum(1 for t in tickers if merged_map.get(t, {}).get("earn_traj")    is not None)
+    has_mom  = sum(1 for t in tickers if pm_data.get(t, {}).get("momentum_score")  is not None)
 
     st.info(
         "Data coverage — "
@@ -1569,6 +1517,7 @@ with page_screener:
         "PEG: {}/{} ({:.0f}%) · ROIC: {}/{} ({:.0f}%) · "
         "ROE: {}/{} ({:.0f}%) · Int Coverage: {}/{} ({:.0f}%) · "
         "Op Margin: {}/{} ({:.0f}%) · Earn Traj: {}/{} ({:.0f}%) · "
+        "Momentum: {}/{} ({:.0f}%) · "
         "Primary: Yahoo{}".format(
             has_pe,   total_t, has_pe   / total_t * 100,
             has_fwd,  total_t, has_fwd  / total_t * 100,
@@ -1578,14 +1527,13 @@ with page_screener:
             has_ic,   total_t, has_ic   / total_t * 100,
             has_om,   total_t, has_om   / total_t * 100,
             has_et,   total_t, has_et   / total_t * 100,
+            has_mom,  total_t, has_mom  / total_t * 100,
             " + FMP bonus" if fmp_key else "",
         )
     )
 
-    # ── Build screener ─────────────────────────────────────────────────────
-    scr = build_screener_table(universe_df, prices, merged_map, momentum)
-
-    # ── v14: render_sector_kpi_panel() call removed (change #3) ──────────
+    # ── Build screener (unified pm_data — v14) ─────────────────────────────
+    scr = build_screener_table(universe_df, pm_data, merged_map)
 
     # ── Apply filters ──────────────────────────────────────────────────────
     filt = scr.copy()
@@ -1602,24 +1550,24 @@ with page_screener:
     ]
 
     sort_map = {
-        "Sector then Rank":             (["Sector", "Rank"],         [True, True]),
-        "Score high to low":            (["Score"],                  [False]),
-        "Conviction high to low":       (["Conviction Score"],       [False]),
-        "MC% of S&P500 high to low":    (["MC% of S&P500"],         [False]),
-        "Price low to high":            (["Price"],                  [True]),
-        "Price high to low":            (["Price"],                  [False]),
-        "Mkt Cap high to low":          (["Mkt Cap"],                [False]),
-        "PE low to high":               (["P/E"],                    [True]),
-        "Fwd PE low to high":           (["Fwd P/E"],                [True]),
-        "PEG low to high":              (["PEG"],                    [True]),
-        "Quality Score high":           (["Quality Score"],          [False]),
-        "ROIC high to low":             (["ROIC%"],                  [False]),
-        "ROE high to low":              (["ROE%"],                   [False]),
-        "Earn Traj high to low":        (["Earn Traj"],              [False]),
-        "Rev Growth high to low":       (["Rev Growth% (CAGR)"],     [False]),
-        "Momentum Score high":          (["Momentum Score"],         [False]),
-        "52W Pos low to high":          (["52W Pos%"],               [True]),
-        "P/E vs Sector Med low to high":(["P/E vs Sector Med"],      [True]),
+        "Sector then Rank":              (["Sector", "Rank"],         [True, True]),
+        "Score high to low":             (["Score"],                  [False]),
+        "Conviction high to low":        (["Conviction Score"],       [False]),
+        "MC% of S&P500 high to low":     (["MC% of S&P500"],         [False]),
+        "Price low to high":             (["Price"],                  [True]),
+        "Price high to low":             (["Price"],                  [False]),
+        "Mkt Cap high to low":           (["Mkt Cap"],                [False]),
+        "PE low to high":                (["P/E"],                    [True]),
+        "Fwd PE low to high":            (["Fwd P/E"],                [True]),
+        "PEG low to high":               (["PEG"],                    [True]),
+        "Quality Score high":            (["Quality Score"],          [False]),
+        "ROIC high to low":              (["ROIC%"],                  [False]),
+        "ROE high to low":               (["ROE%"],                   [False]),
+        "Earn Traj high to low":         (["Earn Traj"],              [False]),
+        "Rev Growth high to low":        (["Rev Growth% (CAGR)"],     [False]),
+        "Momentum Score high":           (["Momentum Score"],         [False]),
+        "52W Pos low to high":           (["52W Pos%"],               [True]),
+        "P/E vs Sector Med low to high": (["P/E vs Sector Med"],      [True]),
     }
     sc, sa = sort_map.get(sort_by, (["Sector", "Rank"], [True, True]))
     filt   = filt.sort_values(sc, ascending=sa, na_position="last")
@@ -1663,7 +1611,6 @@ with page_screener:
         lambda v: int(v) if pd.notna(v) else pd.NA
     )
 
-    # ── v14: "Data Sources" removed from COLS (change #5) ─────────────────
     COLS = [
         "Ticker", "Sector", "Price ($)", "Mkt Cap ($B)", "MC% of S&P500",
         "P/E", "P/E vs Sector Med",
@@ -1688,31 +1635,6 @@ with page_screener:
         mime="text/csv",
     )
 
-    st.markdown("""
-**PEG:** Price/Earnings-to-Growth. PEG < 1.0 = potentially undervalued for its growth rate.
-Only computed when EPS growth ≥ 5%.
-
-**Earn Traj:** (Forward EPS − Trailing EPS) / |Trailing EPS|. Positive = analysts expect
-earnings growth. When both EPS values are negative, capped at +0.30 (recovery-in-progress).
-
-**P/E vs Sector Med** _(v13 new)_: Stock P/E divided by sector median P/E. Values < 1.0
-indicate the stock is cheaper than its sector peers on a trailing earnings basis.
-
-**ROIC:** Excess cash netting — total cash minus 2% of revenue TTM as operating floor.
-Prevents ROIC inflation for cash-rich large-caps (Apple, Microsoft, Alphabet).
-
-**Revenue columns:** Q1 Oldest → Q4 Latest (most recent quarter). Fetched in Phase 2
-alongside ROIC — no separate API round-trip vs v12.
-
-**v14 fixes:** Subtitle removed · Pre-filter caption removed · Sector KPI panel removed ·
-Momentum/52W MultiIndex fix · Data Sources column removed.
-    """)
-
-    st.markdown("---")
-    st.caption(
-        "v14 · UI cleanup · Momentum MultiIndex fix · Sector KPI removed · "
-        "Data Sources column removed · All v13 features preserved"
-    )
 
 # ══════════════════════════════════════════════════════════════════════════════
 # PAGE 2 — COLUMN REFERENCE GUIDE

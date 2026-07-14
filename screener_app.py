@@ -1688,6 +1688,25 @@ with page_screener:
         mime="text/csv",
     )
 
+    st.markdown("""
+**PEG:** Price/Earnings-to-Growth. PEG < 1.0 = potentially undervalued for its growth rate.
+Only computed when EPS growth ≥ 5%.
+
+**Earn Traj:** (Forward EPS − Trailing EPS) / |Trailing EPS|. Positive = analysts expect
+earnings growth. When both EPS values are negative, capped at +0.30 (recovery-in-progress).
+
+**P/E vs Sector Med** _(v13 new)_: Stock P/E divided by sector median P/E. Values < 1.0
+indicate the stock is cheaper than its sector peers on a trailing earnings basis.
+
+**ROIC:** Excess cash netting — total cash minus 2% of revenue TTM as operating floor.
+Prevents ROIC inflation for cash-rich large-caps (Apple, Microsoft, Alphabet).
+
+**Revenue columns:** Q1 Oldest → Q4 Latest (most recent quarter). Fetched in Phase 2
+alongside ROIC — no separate API round-trip vs v12.
+
+**v14 fixes:** Subtitle removed · Pre-filter caption removed · Sector KPI panel removed ·
+Momentum/52W MultiIndex fix · Data Sources column removed.
+    """)
 
     st.markdown("---")
     st.caption(

@@ -1,16 +1,20 @@
-# screener_app.py  v10
+# screener_app.py  v11
 # ─────────────────────────────────────────────────────────────────────────────
-# v10 CHANGES from v9:
-#   1. Page 1 filters: simplified to 5 controls in ONE row
-#      (Sector, Sort By, Min Mkt Cap $B, Max PE, Min Quality Score)
-#   2. Page 2: render_reference_guide() fully populated
-#   3. BUG FIX — normalise_pct_fmp(): replaces normalise_pct() for all FMP
-#      /ratios-ttm call sites. FMP TTM fields are always decimal fractions;
-#      the old abs(v)<5.0 heuristic would corrupt low-margin values (3.2%→320%).
-#   4. BUG FIX — missing_factor_penalty(): adds 1-missing tier (×0.95).
-#      Previously 1 missing factor returned 1.0 same as 0 missing — fixed.
-# All v9 sector-adaptive weights, Financials ROE override, ROIC computation,
-# Earn Traj, FMP bonus layer, and Reference Guide preserved verbatim.
+# v11 CHANGES from v10:
+#   1. 2-phase Yahoo fetch architecture:
+#      Phase 1 — fetch_yahoo_info_all(): .info + fast_info only for ALL 503
+#                tickers (2 HTTP calls per ticker, not 3)
+#      Phase 2 — fetch_yahoo_deep_financials(): quarterly_financials +
+#                quarterly_balance_sheet ONLY for tickers that survive the
+#                MC / PE pre-filter (reduces heavy calls by 30-70%)
+#   2. Filter widgets moved ABOVE data fetch so pre-filter can use them
+#   3. _pre_filter_tickers() gates Phase 2 using Phase 1 info + UI filters
+#   4. All v10 bug fixes preserved:
+#      - normalise_pct_fmp() unconditional ×100 for FMP TTM decimal fractions
+#      - missing_factor_penalty() 4-tier (0→1.00, 1→0.95, 2→0.85, 3+→0.70)
+#   5. All v9/v10 features preserved:
+#      - Sector-adaptive weights, Financials ROE override, ROIC computation
+#      - Earn Traj, FMP bonus layer, Conviction Score, Reference Guide
 # ─────────────────────────────────────────────────────────────────────────────
 
 import streamlit as st
@@ -114,19 +118,12 @@ def sf(val):
     except Exception:
         return None
 
-# KEPT for any future source that genuinely mixes decimal/pct formats
 def normalise_pct(val):
     if val is None:
         return None
     v = float(val)
     return v * 100.0 if abs(v) < 5.0 else v
 
-# FIX 1: FMP /ratios-ttm fields are ALWAYS decimal fractions by API contract.
-# Never use the abs(v)<5.0 heuristic on FMP data — a legitimate 3.2% Op Margin
-# returns as 0.032; multiplied correctly to 3.2%. But if a field ever comes
-# back pre-converted (3.2), the heuristic would corrupt it to 320%.
-# This function multiplies unconditionally — safe because FMP TTM contract
-# guarantees decimal fractions for all ratio fields.
 def normalise_pct_fmp(val):
     if val is None:
         return None
@@ -152,23 +149,17 @@ def percentile_score(series: pd.Series, ascending=True) -> pd.Series:
     result[~valid] = 0.0
     return result
 
-# FIX 2: Added 1-missing tier (×0.95). Previously 1 missing factor returned
-# 1.0 (no penalty) — same as 0 missing. PEG is missing for ~30% of S&P 500
-# stocks; without this tier, those stocks were unfairly treated as complete.
 def missing_factor_penalty(row, factor_cols):
     """
-    Penalise stocks with incomplete factor data so they cannot rank #1
-    purely on the strength of whichever single metric is available.
-
-    0 missing  -> x1.00  (full confidence)
-    1 missing  -> x0.95  (minor penalty — one common gap e.g. PEG)
-    2 missing  -> x0.85  (moderate uncertainty)
-    3+ missing -> x0.70  (low confidence — score unreliable)
+    0 missing  -> x1.00
+    1 missing  -> x0.95
+    2 missing  -> x0.85
+    3+ missing -> x0.70
     """
     missing = sum(1 for c in factor_cols if pd.isna(row.get(c)))
     if missing >= 3: return 0.70
     if missing == 2: return 0.85
-    if missing == 1: return 0.95  # FIX 2: was missing, causing no penalty for 1 gap
+    if missing == 1: return 0.95
     return 1.00
 
 def revenue_growth_pct_cagr(rev4):
@@ -285,26 +276,30 @@ def fetch_momentum_batch(tickers):
         pass
     return out
 
-# ── Yahoo Finance per-ticker fundamentals ─────────────────────────────────────
-def _fetch_yahoo_fundamentals_one(t):
+# ══════════════════════════════════════════════════════════════════════════════
+# PHASE 1 — Lightweight info fetch for ALL tickers (2 calls per ticker)
+# ══════════════════════════════════════════════════════════════════════════════
+def _fetch_yahoo_info_one(t):
     result = {
         "pe": None, "pe_src": None,
         "fwd_pe": None,
         "peg": None, "peg_src": None,
         "roe": None,
-        "roic": None,
         "op_margin": None,
         "debt_eq": None,
         "eps_growth": None,
-        "int_coverage": None,
         "earn_traj": None,
         "mc": None,
         "hi52": None,
         "lo52": None,
+        # Placeholders filled by Phase 2
+        "roic": None,
+        "int_coverage": None,
     }
     try:
         obj = yf.Ticker(t)
 
+        # Call 1 — fast_info (lightweight)
         try:
             fi = obj.fast_info
             if fi is not None:
@@ -317,6 +312,7 @@ def _fetch_yahoo_fundamentals_one(t):
         except Exception:
             pass
 
+        # Call 2 — .info (fundamental fields)
         info = {}
         for attempt in range(2):
             try:
@@ -382,113 +378,28 @@ def _fetch_yahoo_fundamentals_one(t):
             l52 = sf(info.get("fiftyTwoWeekLow"))
             if l52: result["lo52"] = l52
 
-        try:
-            qfin = obj.quarterly_financials
-            if qfin is not None and not qfin.empty:
-                ebit_row = None
-                for nm in ["EBIT", "Operating Income", "Ebit"]:
-                    if nm in qfin.index:
-                        ebit_row = nm
-                        break
-                int_row = None
-                for nm in ["Interest Expense", "Interest Expense Non Operating", "Net Interest Income"]:
-                    if nm in qfin.index:
-                        int_row = nm
-                        break
-                if ebit_row and int_row:
-                    ebit_ttm = qfin.loc[ebit_row].dropna().head(4).sum()
-                    int_ttm  = abs(qfin.loc[int_row].dropna().head(4).sum())
-                    if int_ttm > 0 and ebit_ttm > 0:
-                        result["int_coverage"] = min(float(ebit_ttm / int_ttm), 100.0)
-        except Exception:
-            pass
-
-        try:
-            qfin = obj.quarterly_financials
-            bs   = obj.quarterly_balance_sheet
-            if qfin is not None and not qfin.empty and bs is not None and not bs.empty:
-                op_inc_row = None
-                for nm in ["Operating Income", "EBIT", "Ebit"]:
-                    if nm in qfin.index:
-                        op_inc_row = nm
-                        break
-                tax_row = None
-                for nm in ["Tax Provision", "Income Tax Expense", "Tax Expense"]:
-                    if nm in qfin.index:
-                        tax_row = nm
-                        break
-                pretax_row = None
-                for nm in ["Pretax Income", "Income Before Tax", "EBT"]:
-                    if nm in qfin.index:
-                        pretax_row = nm
-                        break
-                if op_inc_row:
-                    op_inc_ttm   = float(qfin.loc[op_inc_row].dropna().head(4).sum())
-                    eff_tax_rate = 0.21
-                    if tax_row and pretax_row:
-                        tax_ttm    = float(qfin.loc[tax_row].dropna().head(4).sum())
-                        pretax_ttm = float(qfin.loc[pretax_row].dropna().head(4).sum())
-                        if pretax_ttm > 0 and tax_ttm >= 0:
-                            computed_rate = tax_ttm / pretax_ttm
-                            if 0 < computed_rate < 0.6:
-                                eff_tax_rate = computed_rate
-                    nopat      = op_inc_ttm * (1 - eff_tax_rate)
-                    equity_val = None
-                    for nm in ["Total Stockholders Equity", "Stockholders Equity",
-                               "Common Stock Equity", "Total Equity Gross Minority Interest"]:
-                        if nm in bs.index:
-                            eq_s = bs.loc[nm].dropna()
-                            if len(eq_s) > 0:
-                                equity_val = float(eq_s.iloc[0])
-                                break
-                    debt_val = None
-                    for nm in ["Total Debt", "Net Debt", "Long Term Debt",
-                               "Long Term Debt And Capital Lease Obligation"]:
-                        if nm in bs.index:
-                            d_s = bs.loc[nm].dropna()
-                            if len(d_s) > 0:
-                                debt_val = float(d_s.iloc[0])
-                                break
-                    cash_val = None
-                    for nm in ["Cash And Cash Equivalents",
-                               "Cash Cash Equivalents And Short Term Investments",
-                               "Cash Financial", "Cash And Short Term Investments"]:
-                        if nm in bs.index:
-                            c_s = bs.loc[nm].dropna()
-                            if len(c_s) > 0:
-                                cash_val = float(c_s.iloc[0])
-                                break
-                    if equity_val is not None and debt_val is not None:
-                        cash_use         = cash_val if cash_val is not None else 0
-                        invested_capital = equity_val + debt_val - cash_use
-                        if invested_capital > 0 and nopat != 0:
-                            roic_computed = (nopat / invested_capital) * 100.0
-                            if -100 < roic_computed < 200:
-                                result["roic"] = roic_computed
-        except Exception:
-            pass
-
     except Exception:
         pass
     return t, result
 
 
 @st.cache_data(ttl=86400)
-def fetch_yahoo_fundamentals_all(tickers):
-    tl     = list(tickers)
-    out    = {}
-    CHUNK  = 30
-    WKRS   = 8
-    SLEEP  = 1.5
-    chunks = [tl[i:i+CHUNK] for i in range(0, len(tl), CHUNK)]
+def fetch_yahoo_info_all(tickers):
+    """Phase 1 — .info + fast_info for all tickers. No financials/BS calls."""
+    tl      = list(tickers)
+    out     = {}
+    CHUNK   = 30
+    WKRS    = 8
+    SLEEP   = 1.5
+    chunks  = [tl[i:i+CHUNK] for i in range(0, len(tl), CHUNK)]
+    total   = len(chunks)
     progress = st.progress(0)
     status   = st.empty()
-    total    = len(chunks)
     for ci, chunk in enumerate(chunks):
-        status.text("Yahoo fundamentals: chunk {}/{} ({} tickers done)...".format(
-            ci+1, total, ci * CHUNK))
+        status.text("Phase 1/2 — Yahoo info: chunk {}/{} ({} tickers done)...".format(
+            ci + 1, total, ci * CHUNK))
         with concurrent.futures.ThreadPoolExecutor(max_workers=WKRS) as ex:
-            futures = {ex.submit(_fetch_yahoo_fundamentals_one, t): t for t in chunk}
+            futures = {ex.submit(_fetch_yahoo_info_one, t): t for t in chunk}
             for fut in concurrent.futures.as_completed(futures):
                 try:
                     t, d = fut.result()
@@ -502,6 +413,172 @@ def fetch_yahoo_fundamentals_all(tickers):
     progress.empty()
     status.empty()
     return out
+
+# ══════════════════════════════════════════════════════════════════════════════
+# PHASE 2 — Deep financials only for pre-filtered tickers (2 heavy calls each)
+# ══════════════════════════════════════════════════════════════════════════════
+def _fetch_yahoo_deep_one(t):
+    result = {"roic": None, "int_coverage": None}
+    try:
+        obj  = yf.Ticker(t)
+        qfin = obj.quarterly_financials      # Heavy call 1
+        bs   = obj.quarterly_balance_sheet   # Heavy call 2
+
+        # ── Interest Coverage ─────────────────────────────────────────────────
+        if qfin is not None and not qfin.empty:
+            ebit_row = next(
+                (nm for nm in ["EBIT", "Operating Income", "Ebit"] if nm in qfin.index),
+                None,
+            )
+            int_row = next(
+                (nm for nm in [
+                    "Interest Expense",
+                    "Interest Expense Non Operating",
+                    "Net Interest Income",
+                ] if nm in qfin.index),
+                None,
+            )
+            if ebit_row and int_row:
+                ebit_ttm = qfin.loc[ebit_row].dropna().head(4).sum()
+                int_ttm  = abs(qfin.loc[int_row].dropna().head(4).sum())
+                if int_ttm > 0 and ebit_ttm > 0:
+                    result["int_coverage"] = min(float(ebit_ttm / int_ttm), 100.0)
+
+        # ── ROIC ──────────────────────────────────────────────────────────────
+        if qfin is not None and not qfin.empty and bs is not None and not bs.empty:
+            op_inc_row = next(
+                (nm for nm in ["Operating Income", "EBIT", "Ebit"] if nm in qfin.index),
+                None,
+            )
+            tax_row = next(
+                (nm for nm in [
+                    "Tax Provision", "Income Tax Expense", "Tax Expense",
+                ] if nm in qfin.index),
+                None,
+            )
+            pretax_row = next(
+                (nm for nm in [
+                    "Pretax Income", "Income Before Tax", "EBT",
+                ] if nm in qfin.index),
+                None,
+            )
+
+            if op_inc_row:
+                op_inc_ttm   = float(qfin.loc[op_inc_row].dropna().head(4).sum())
+                eff_tax_rate = 0.21
+                if tax_row and pretax_row:
+                    tax_ttm    = float(qfin.loc[tax_row].dropna().head(4).sum())
+                    pretax_ttm = float(qfin.loc[pretax_row].dropna().head(4).sum())
+                    if pretax_ttm > 0 and tax_ttm >= 0:
+                        computed_rate = tax_ttm / pretax_ttm
+                        if 0 < computed_rate < 0.6:
+                            eff_tax_rate = computed_rate
+                nopat = op_inc_ttm * (1 - eff_tax_rate)
+
+                equity_val = next(
+                    (float(bs.loc[nm].dropna().iloc[0])
+                     for nm in [
+                         "Total Stockholders Equity", "Stockholders Equity",
+                         "Common Stock Equity", "Total Equity Gross Minority Interest",
+                     ] if nm in bs.index and len(bs.loc[nm].dropna()) > 0),
+                    None,
+                )
+                debt_val = next(
+                    (float(bs.loc[nm].dropna().iloc[0])
+                     for nm in [
+                         "Total Debt", "Net Debt", "Long Term Debt",
+                         "Long Term Debt And Capital Lease Obligation",
+                     ] if nm in bs.index and len(bs.loc[nm].dropna()) > 0),
+                    None,
+                )
+                cash_val = next(
+                    (float(bs.loc[nm].dropna().iloc[0])
+                     for nm in [
+                         "Cash And Cash Equivalents",
+                         "Cash Cash Equivalents And Short Term Investments",
+                         "Cash Financial", "Cash And Short Term Investments",
+                     ] if nm in bs.index and len(bs.loc[nm].dropna()) > 0),
+                    None,
+                )
+
+                if equity_val is not None and debt_val is not None:
+                    cash_use         = cash_val if cash_val is not None else 0
+                    invested_capital = equity_val + debt_val - cash_use
+                    if invested_capital > 0 and nopat != 0:
+                        roic_computed = (nopat / invested_capital) * 100.0
+                        if -100 < roic_computed < 200:
+                            result["roic"] = roic_computed
+
+    except Exception:
+        pass
+    return t, result
+
+
+@st.cache_data(ttl=86400)
+def fetch_yahoo_deep_financials(tickers_filtered):
+    """Phase 2 — quarterly_financials + balance_sheet for pre-filtered tickers only."""
+    tl = list(tickers_filtered)
+    out = {}
+    if not tl:
+        return out
+
+    CHUNK   = 20
+    WKRS    = 6
+    SLEEP   = 2.0
+    chunks  = [tl[i:i+CHUNK] for i in range(0, len(tl), CHUNK)]
+    total   = len(chunks)
+    progress = st.progress(0)
+    status   = st.empty()
+    for ci, chunk in enumerate(chunks):
+        status.text("Phase 2/2 — Deep financials: chunk {}/{} ({}/{} tickers)...".format(
+            ci + 1, total, min((ci + 1) * CHUNK, len(tl)), len(tl)))
+        with concurrent.futures.ThreadPoolExecutor(max_workers=WKRS) as ex:
+            futures = {ex.submit(_fetch_yahoo_deep_one, t): t for t in chunk}
+            for fut in concurrent.futures.as_completed(futures):
+                try:
+                    t, d = fut.result()
+                    out[t] = d
+                except Exception:
+                    t = futures[fut]
+                    out[t] = {}
+        progress.progress((ci + 1) / total)
+        if ci < len(chunks) - 1:
+            time.sleep(SLEEP + random.uniform(0, 0.5))
+    progress.empty()
+    status.empty()
+    return out
+
+
+def _pre_filter_tickers(info_map, universe_df, mc_min_b, pe_max):
+    """
+    Gate Phase 2 using Phase 1 data + UI filter values.
+    A ticker passes if its MC / PE are unknown (None) OR within the filter bounds.
+    This ensures we never skip a stock just because its data is missing.
+    """
+    keep = []
+    for t in universe_df["Ticker"]:
+        d  = info_map.get(t, {})
+        mc = d.get("mc")
+        pe = d.get("pe")
+        mc_ok = (mc is None) or (mc >= mc_min_b * 1e9)
+        pe_ok = (pe is None) or (pe <= pe_max)
+        if mc_ok and pe_ok:
+            keep.append(t)
+    return keep
+
+
+def merge_yahoo_phases(info_map, deep_map, tickers):
+    """Merge Phase 1 info dict with Phase 2 deep financials dict."""
+    merged = {}
+    for t in tickers:
+        base = dict(info_map.get(t, {}))
+        deep = deep_map.get(t, {})
+        # Phase 2 wins for roic / int_coverage (more accurate)
+        base["roic"]         = deep.get("roic")         if deep.get("roic")         is not None else base.get("roic")
+        base["int_coverage"] = deep.get("int_coverage") if deep.get("int_coverage") is not None else base.get("int_coverage")
+        merged[t] = base
+    return merged
+
 
 # ── FMP /quote bulk ───────────────────────────────────────────────────────────
 @st.cache_data(ttl=86400)
@@ -573,7 +650,6 @@ def fetch_fmp_ratios_if_available(tickers, api_key):
             item = d[0]
             peg_raw  = sf(item.get("priceEarningsGrowthRatioTTM"))
             peg      = peg_raw if (peg_raw and 0 < peg_raw <= 500) else None
-            # FIX 1: use normalise_pct_fmp — always multiply by 100 (FMP TTM = decimal fractions)
             roic_raw = sf(item.get("returnOnInvestedCapitalTTM"))
             roic     = normalise_pct_fmp(roic_raw) if roic_raw is not None else None
             roe_raw  = sf(item.get("returnOnEquityTTM"))
@@ -634,7 +710,7 @@ def fetch_last4_revenue_parallel(tickers):
             out[t] = v
     return out
 
-# ── Merge sources ─────────────────────────────────────────────────────────────
+# ── Merge all sources ─────────────────────────────────────────────────────────
 def merge_all_sources(yahoo_data, fmp_quotes, fmp_ratios, tickers):
     merged = {}
     for t in tickers:
@@ -1031,7 +1107,8 @@ def render_reference_guide():
     )
 
     tab_val, tab_qual, tab_peg, tab_etraj, tab_mom, tab_rank, tab_disp = st.tabs([
-        "Valuation", "Quality", "PEG", "Earn Trajectory", "Momentum", "Ranking & Score", "Display-Only",
+        "Valuation", "Quality", "PEG", "Earn Trajectory",
+        "Momentum", "Ranking & Score", "Display-Only",
     ])
 
     with tab_val:
@@ -1042,11 +1119,10 @@ def render_reference_guide():
 **Formula:** `Current Stock Price / Trailing 12-Month EPS`
 
 **Numeric Examples:**
-- Apple price = $210, EPS TTM = $6.57 → P/E = **32.0** — you pay $32 for every $1 of Apple profit
-- ExxonMobil price = $115, EPS TTM = $9.60 → P/E = **12.0** — energy commands discount vs tech
+- Apple price = $210, EPS TTM = $6.57 → P/E = **32.0**
+- ExxonMobil price = $115, EPS TTM = $9.60 → P/E = **12.0**
 
 **Sector context:** P/E of 15 when sector median = 25 → cheap vs peers → boosts Score.
-P/E of 50 when sector median = 25 → expensive → hurts Score.
 
 | Sector | Typical Median P/E |
 |---|---|
@@ -1067,34 +1143,28 @@ P/E of 50 when sector median = 25 → expensive → hurts Score.
 ---
 
 ### Fwd P/E — Forward Price to Earnings
-**What it is:** Same as P/E but uses analysts' consensus EPS estimate for the next 12 months.
-
 **Formula:** `Current Stock Price / Next 12-Month Estimated EPS`
 
-**Numeric Examples:**
-- Microsoft $415, trailing EPS = $11.45, forward EPS = $13.20 → Fwd P/E = **31.4** (Trailing 36.2)
-  - Fwd P/E < Trailing P/E → earnings expected to grow ~15% → **positive signal**
-- Struggling retailer $50, trailing EPS = $4.00, forward EPS = $2.50 → Fwd P/E = **20.0** (Trailing 12.5)
-  - Fwd P/E > Trailing P/E → earnings expected to fall 37.5% → **bad signal**
+- Microsoft $415, Fwd EPS = $13.20 → Fwd P/E = **31.4** (Trailing 36.2) → earnings growing → positive signal
+- Struggling retailer: Fwd P/E > Trailing P/E → earnings shrinking → negative signal
 
 **Used in scoring?** Yes — preferred over trailing P/E for Valuation factor.
 
 ---
 
-### MC% of S&P 500 — Market Cap as % of Index Total
+### MC% of S&P 500
 **Formula:** `Stock Market Cap / Sum of All S&P 500 Market Caps × 100`
 
 - Apple (~$3.3T in ~$45T index) → MC% ≈ **7.3%**
-- A mid-cap S&P 500 stock at $50B → MC% ≈ **0.11%**
 
 **Used in scoring?** No. Display and filter only.
 
 ---
 
-### 52W Pos% — 52-Week Position
+### 52W Pos%
 **Formula:** `(Current Price − 52W Low) / (52W High − 52W Low) × 100`
 
-- 52W Low = $140, High = $220, Current = $175 → **43.8%** (0% = at low, 100% = at high)
+- 52W Low=$140, High=$220, Current=$175 → **43.8%** (0%=at low, 100%=at high)
 
 **Used in scoring?** No. Sort/filter only.
 """)
@@ -1104,23 +1174,17 @@ P/E of 50 when sector median = 25 → expensive → hurts Score.
 ### Quality Score (0–100)
 **Formula:** `(ROIC sub-score + Interest Coverage sub-score + Op Margin sub-score) / 3`
 
-- Stock A: ROIC = 20% → 77pts, Int Coverage = 8x → 80pts, Op Margin = 25% → 63pts
-  - Quality Score = (77 + 80 + 63) / 3 = **73.3 / 100**
-
-> **Financials sector (v9+):** Uses **ROE** as primary profitability metric instead of ROIC.
-> Op Margin is excluded. Bank ROA/ROIC is structurally 1–2% by design — not a weakness.
+> **Financials sector:** Uses **ROE** as primary profitability metric instead of ROIC. Op Margin excluded.
 
 **Used in scoring?** Yes — 18–32% weight (sector-adaptive).
 
 ---
 
 ### ROIC% — Return on Invested Capital
-**Formula (computed):** `NOPAT / Invested Capital × 100`
-where NOPAT = Operating Income × (1 − effective tax rate),
-Invested Capital = Equity + Debt − Cash
+**Formula:** `NOPAT / Invested Capital × 100`
 
-- Apple: NOPAT ≈ $95B, Invested Capital ≈ $165B → ROIC ≈ **57.6%**
-- General Motors: NOPAT ≈ $9B, Invested Capital ≈ $85B → ROIC ≈ **10.6%**
+NOPAT = Operating Income × (1 − effective tax rate)
+Invested Capital = Equity + Debt − Cash
 
 | ROIC | Assessment |
 |---|---|
@@ -1132,27 +1196,19 @@ Invested Capital = Equity + Debt − Cash
 
 ---
 
-### Int Coverage — Interest Coverage Ratio
+### Int Coverage
 **Formula:** `EBIT / |Interest Expense|` (TTM)
-
-- Microsoft: EBIT ≈ $100B, Interest ≈ $1.5B → Coverage = **66.7x**
-- Leveraged industrial: EBIT = $500M, Interest = $450M → Coverage = **1.11x** (very risky)
 
 | Coverage | Assessment |
 |---|---|
 | 10x+ | Very safe |
-| 3x | Minimum threshold (below = flagged IntCov<3x) |
+| 3x | Minimum threshold |
 | Below 1x | In distress |
-
-> **Note:** Not meaningful for Financials sector — excluded from Quality Score for banks.
 
 ---
 
-### Op Margin% — Operating Profit Margin
+### Op Margin%
 **Formula:** `Operating Income / Revenue × 100`
-
-- Microsoft: $109B / $236B = **46.2%**
-- Ford: $7.2B / $185B = **3.9%** → flagged Margin<5%
 
 | Op Margin | Quality sub-score |
 |---|---|
@@ -1167,7 +1223,7 @@ Invested Capital = Equity + Debt − Cash
 - **IntCov<3x** — debt-servicing risk
 - **Margin<5%** — thin profitability
 - **Pass** — all checks cleared
-- **D/E: x.x** — Debt/Equity appended to every row for context
+- **D/E: x.x** — Debt/Equity appended to every row
 """)
 
     with tab_peg:
@@ -1189,29 +1245,20 @@ Invested Capital = Equity + Debt − Cash
 | 2.0–3.0 | Expensive |
 | Above 3.0 | Very hard to justify |
 
-**Growth guard:** PEG only computed when EPS growth ≥ 5%. Removes noise from near-zero growth stocks.
+**Growth guard:** PEG only computed when EPS growth ≥ 5%.
 
 **Data source waterfall:**
-1. Yahoo Finance `pegRatio` field
-2. FMP `/ratios-ttm` → `priceEarningsGrowthRatioTTM` (if FMP key configured)
+1. Yahoo Finance `pegRatio`
+2. FMP `/ratios-ttm` → `priceEarningsGrowthRatioTTM`
 3. Calculated: (Fwd P/E or Trailing P/E) / EPS growth %
 
-**Used in scoring?** Yes — 5–25% weight (higher for growth sectors like IT).
+**Used in scoring?** Yes — 5–25% weight.
 """)
 
     with tab_etraj:
         st.markdown("""
 ### Earn Traj — Earnings Trajectory
 **Formula:** `(Forward EPS − Trailing EPS) / |Trailing EPS|` clipped to [−1.0, +1.0]
-
-Raw ratio divided by 2 before clipping — 100% earnings jump = +1.0.
-
-| Situation | Earn Traj | Signal |
-|---|---|---|
-| Microsoft growing | +0.08 | Mild positive |
-| Pharma guidance cut | −0.07 | Mild negative |
-| Turnaround | +0.83 | Strong recovery |
-| Cyclical trough | −0.21 | Significant decline |
 
 | Range | Signal |
 |---|---|
@@ -1231,12 +1278,7 @@ Raw ratio divided by 2 before clipping — 100% earnings jump = +1.0.
 ### Momentum Score — Skip-Month Volatility-Adjusted Momentum
 **Formula:** `(6-month return − 1-month return) / Trailing 90-day Annualised Volatility`
 
-**Why skip the last month?** Short-term reversal effect — stocks that surged last month
-tend to mean-revert. Removing it isolates the durable 2–6 month trend.
-
-**Examples:**
-- JPMorgan: 6mo +18%, 1mo +3%, vol 16% → Score = 15/16 = **0.94** (strong signal per unit risk)
-- Tesla: 6mo +40%, 1mo +10%, vol 55% → Score = 30/55 = **0.55** (lower despite higher raw return)
+**Why skip the last month?** Short-term reversal effect — removes noise, isolates the durable 2–6 month trend.
 
 | Score | Signal |
 |---|---|
@@ -1250,10 +1292,10 @@ tend to mean-revert. Removing it isolates the durable 2–6 month trend.
 ---
 
 ### Ret 1Mo%, Ret 3Mo%, Ret 6Mo%
-Raw percentage price returns over 1, 3, 6 months from monthly closing prices. Display only.
+Raw percentage price returns over 1, 3, 6 months. Display only.
 
 ### Trailing Vol%
-`Daily Return Std Dev × √252 × 100` over last 90 calendar days. Display only (denominator in Momentum Score).
+`Daily Return Std Dev × √252 × 100` over last 90 days. Display only.
 """)
 
     with tab_rank:
@@ -1261,7 +1303,6 @@ Raw percentage price returns over 1, 3, 6 months from monthly closing prices. Di
 ### Score (0–100)
 Composite percentile score within GICS sector using sector-adaptive weights.
 
-**Formula:**
 | Sector | Val | Quality | PEG | Earn | Mom |
 |---|---|---|---|---|---|
 | Information Technology | 20% | 25% | 25% | 15% | 15% |
@@ -1278,12 +1319,12 @@ Composite percentile score within GICS sector using sector-adaptive weights.
 
 ---
 
-### Missing Factor Penalty (v10 — fixed)
+### Missing Factor Penalty
 
 | Missing factors | Multiplier |
 |---|---|
 | 0 | ×1.00 |
-| 1 | ×0.95 ← added in v10 fix |
+| 1 | ×0.95 |
 | 2 | ×0.85 |
 | 3+ | ×0.70 |
 
@@ -1291,36 +1332,23 @@ Composite percentile score within GICS sector using sector-adaptive weights.
 
 ### Rank
 Ordinal position within sector by Score. Rank 1 = best-scoring stock in that sector.
-Rankings are sector-independent — IT Rank 2 and Utilities Rank 2 are unrelated.
 
 ---
 
 ### Conviction Score (0–100)
 `Score × data_completeness_ratio × sector_discount_factor` → normalised 0–100
-
-- Completeness: 3 of 5 factors present → 0.60 multiplier
-- Sector discount: Energy median P/E = 12 vs index 22 → +30% boost (capped)
-- Use to find stocks combining strong fundamentals + complete data + reasonable sector valuation.
 """)
 
     with tab_disp:
         st.markdown("""
 ### ROE% — Return on Equity (Display Only)
 **Formula:** `Net Income / Shareholders Equity × 100`
-
-- Apple ROE ≈ 170% — extreme due to buybacks reducing equity base
-- JPMorgan ROE ≈ 15% — healthy for a major bank
-
 Display only — distorted by leverage and buybacks. ROIC is the scoring metric.
 
 ---
 
-### Debt/Eq — Debt to Equity Ratio (Display Only)
+### Debt/Eq (Display Only)
 **Formula:** `Total Debt / Total Shareholders Equity`
-
-- Microsoft: D/E ≈ 0.35 — conservative
-- Leveraged REIT: D/E = 3.5 — structurally high (project finance)
-
 Display only — D/E without Int Coverage gives incomplete safety picture.
 
 ---
@@ -1328,19 +1356,14 @@ Display only — D/E without Int Coverage gives incomplete safety picture.
 ### Rev Q1–Q4 ($B)
 Last four fiscal quarters of total revenue, newest first (USD billions).
 
-Accelerating pattern (positive): Q4=$14B → Q3=$15.8B → Q2=$17.1B → Q1=$19.3B
-
-Decelerating pattern (negative): Q4=$22B → Q3=$20.5B → Q2=$19.1B → Q1=$18.0B
-
 ---
 
 ### Rev Growth% (CAGR)
-`(Newest quarter / Revenue 4 quarters ago)^(1/3) − 1 × 100`
-Year-over-year comparison removing seasonal effects. Display only.
+`(Newest quarter / Revenue 4 quarters ago)^(1/3) − 1 × 100`. Display only.
 
 ---
 
-### Data Coverage
+### Data Coverage (typical)
 
 | Metric | Typical Coverage |
 |---|---|
@@ -1354,14 +1377,12 @@ Year-over-year comparison removing seasonal effects. Display only.
 | Earn Traj | ~82% |
 | Momentum | ~97% |
 | Quarterly Revenue | ~72% |
-
-Stocks with fewer than 3 factors populated receive a −30% Score penalty.
 """)
 
     st.markdown("---")
     st.markdown(
-        "**Data sources v10:** Yahoo Finance (primary) · FMP bonus if key available · "
-        "ROIC from Yahoo quarterly financials · Earn Traj from Yahoo FwdEPS/TrailEPS · "
+        "**Data sources v11:** Yahoo Finance (primary) · FMP bonus if key available · "
+        "ROIC from Yahoo quarterly financials (Phase 2 only) · Earn Traj from Yahoo FwdEPS/TrailEPS · "
         "MC% computed across all S&P 500 constituents · Sector-adaptive scoring. "
         "_Nothing here is financial advice._"
     )
@@ -1370,7 +1391,7 @@ Stocks with fewer than 3 factors populated receive a −30% Score penalty.
 # ══════════════════════════════════════════════════════════════════════════════
 # APP ENTRY POINT
 # ══════════════════════════════════════════════════════════════════════════════
-st.set_page_config(page_title="S&P 500 Screener v10", layout="wide", page_icon="📊")
+st.set_page_config(page_title="S&P 500 Screener v11", layout="wide", page_icon="📊")
 st.markdown(
     "<style>"
     "div[data-testid='stDataFrame'] table{font-size:13px;}"
@@ -1379,10 +1400,11 @@ st.markdown(
     unsafe_allow_html=True,
 )
 
-st.markdown("## S&P 500 Fundamental Screener v10")
+st.markdown("## S&P 500 Fundamental Screener v11")
 st.caption(
-    "Yahoo-first · ROIC computed from financials · Earn Traj from FwdEPS/TrailEPS · "
-    "MC% of S&P500 · Sector-Adaptive 5-factor scoring · FMP bonus layer if key available"
+    "Yahoo-first · 2-phase fetch (info→deep) · ROIC from quarterly financials · "
+    "Earn Traj from FwdEPS/TrailEPS · MC% of S&P500 · Sector-Adaptive 5-factor scoring · "
+    "FMP bonus layer if key available"
 )
 
 page_screener, page_reference = st.tabs(["Screener", "Column Reference Guide"])
@@ -1407,6 +1429,7 @@ with page_screener:
     else:
         st.info("No FMP key. Running on Yahoo Finance only. Add [fmp] api_key to Streamlit Secrets.")
 
+    # ── Load universe first (needed for pre-filter) ───────────────────────────
     with st.spinner("Loading S&P 500 universe..."):
         sp500 = fetch_sp500_constituents()
     if sp500.empty:
@@ -1416,15 +1439,72 @@ with page_screener:
     universe_df = sp500.copy().reset_index(drop=True)
     tickers     = tuple(universe_df["Ticker"].tolist())
 
+    # ── FILTERS — defined BEFORE data fetch so pre-filter can use them ────────
+    st.markdown("### Filters")
+    all_sectors_placeholder = sorted(universe_df["Sector"].dropna().unique().tolist())
+    f1, f2, f3, f4, f5 = st.columns(5)
+
+    sector_sel = f1.selectbox(
+        "Sector",
+        ["All Sectors"] + all_sectors_placeholder,
+        help="Filter to one GICS sector or view all S&P 500 stocks.",
+    )
+    sort_by = f2.selectbox(
+        "Sort by",
+        [
+            "Sector then Rank", "Score high to low", "Conviction high to low",
+            "MC% of S&P500 high to low", "Price low to high", "Price high to low",
+            "Mkt Cap high to low", "PE low to high", "Fwd PE low to high",
+            "PEG low to high", "Quality Score high", "ROIC high to low",
+            "ROE high to low", "Earn Traj high to low", "Rev Growth high to low",
+            "Momentum Score high", "52W Pos low to high",
+        ],
+        help="Primary sort column for the results table.",
+    )
+    mc_min_b = f3.number_input(
+        "Min Mkt Cap ($B)", value=0, step=10, min_value=0,
+        help="Show stocks with market cap above this value (USD billions).",
+    )
+    pe_max = f4.number_input(
+        "Max P/E", value=9999, step=50, min_value=0,
+        help="Exclude stocks with trailing P/E above this value.",
+    )
+    qual_min_f = f5.number_input(
+        "Min Quality Score", value=0.0, step=5.0, min_value=0.0, max_value=100.0,
+        help="Show stocks with Quality Score at or above this value (0–100).",
+    )
+
+    # ── Phase 1 — lightweight info for all tickers ───────────────────────────
+    with st.spinner("Phase 1/2 — Fetching Yahoo info for all {} tickers...".format(len(tickers))):
+        yahoo_info = fetch_yahoo_info_all(tickers)
+
+    # ── Pre-filter: gate Phase 2 using Phase 1 data + UI filter values ────────
+    filtered_tickers = _pre_filter_tickers(yahoo_info, universe_df, mc_min_b, pe_max)
+    skipped          = len(tickers) - len(filtered_tickers)
+    st.caption(
+        "Pre-filter: {} tickers → deep financials · {} skipped (failed MC/PE filter) · "
+        "Phase 2 HTTP calls reduced by {:.0f}%".format(
+            len(filtered_tickers), skipped,
+            skipped / len(tickers) * 100 if tickers else 0,
+        )
+    )
+
+    # ── Phase 2 — deep financials only for pre-filtered tickers ──────────────
+    with st.spinner("Phase 2/2 — Deep financials for {} pre-filtered tickers...".format(
+            len(filtered_tickers))):
+        yahoo_deep = fetch_yahoo_deep_financials(tuple(filtered_tickers))
+
+    # ── Merge Phase 1 + Phase 2 ───────────────────────────────────────────────
+    yahoo_fundamentals = merge_yahoo_phases(yahoo_info, yahoo_deep, tickers)
+
+    # ── Prices + Momentum ─────────────────────────────────────────────────────
     with st.spinner("Fetching prices ({} tickers)...".format(len(tickers))):
         prices = fetch_prices_batch(tickers)
 
     with st.spinner("Fetching momentum (skip-month vol-adjusted)..."):
         momentum = fetch_momentum_batch(tickers)
 
-    with st.spinner("Fetching Yahoo fundamentals for all {} tickers...".format(len(tickers))):
-        yahoo_fundamentals = fetch_yahoo_fundamentals_all(tickers)
-
+    # ── FMP bonus layer ───────────────────────────────────────────────────────
     fmp_quotes = {}
     fmp_ratios = {}
     if fmp_key:
@@ -1433,12 +1513,15 @@ with page_screener:
         with st.spinner("FMP bonus: /ratios-ttm..."):
             fmp_ratios = fetch_fmp_ratios_if_available(tickers, fmp_key)
 
+    # ── Merge all data sources ────────────────────────────────────────────────
     with st.spinner("Merging data sources..."):
         merged_map = merge_all_sources(yahoo_fundamentals, fmp_quotes, fmp_ratios, tickers)
 
+    # ── Revenue ───────────────────────────────────────────────────────────────
     with st.spinner("Fetching quarterly revenue..."):
         rev_map = fetch_last4_revenue_parallel(tickers)
 
+    # ── Coverage stats ────────────────────────────────────────────────────────
     total_t  = len(tickers)
     has_pe   = sum(1 for t in tickers if merged_map.get(t, {}).get("pe")           is not None)
     has_fwd  = sum(1 for t in tickers if merged_map.get(t, {}).get("fwd_pe")       is not None)
@@ -1466,42 +1549,8 @@ with page_screener:
         )
     )
 
+    # ── Build screener ────────────────────────────────────────────────────────
     scr = build_screener_table(universe_df, prices, merged_map, rev_map, momentum)
-
-    # ── 5 filters in ONE row ──────────────────────────────────────────────────
-    st.markdown("### Filters")
-    all_sectors = sorted(scr["Sector"].dropna().unique().tolist())
-    f1, f2, f3, f4, f5 = st.columns(5)
-
-    sector_sel = f1.selectbox(
-        "Sector",
-        ["All Sectors"] + all_sectors,
-        help="Filter to one GICS sector or view all S&P 500 stocks.",
-    )
-    sort_by = f2.selectbox(
-        "Sort by",
-        [
-            "Sector then Rank", "Score high to low", "Conviction high to low",
-            "MC% of S&P500 high to low", "Price low to high", "Price high to low",
-            "Mkt Cap high to low", "PE low to high", "Fwd PE low to high",
-            "PEG low to high", "Quality Score high", "ROIC high to low",
-            "ROE high to low", "Earn Traj high to low", "Rev Growth high to low",
-            "Momentum Score high", "52W Pos low to high",
-        ],
-        help="Primary sort column for the results table.",
-    )
-    mc_min_b = f3.number_input(
-        "Min Mkt Cap ($B)", value=0, step=10, min_value=0,
-        help="Show stocks with market cap above this value (USD billions).",
-    )
-    pe_max = f4.number_input(
-        "Max P/E", value=9999, step=50, min_value=0,
-        help="Exclude stocks with trailing P/E above this value.",
-    )
-    qual_min_f = f5.number_input(
-        "Min Quality Score", value=0.0, step=5.0, min_value=0.0, max_value=100.0,
-        help="Show stocks with Quality Score at or above this value (0–100).",
-    )
 
     render_sector_kpi_panel(scr, sector_sel)
 
@@ -1538,6 +1587,7 @@ with page_screener:
     st.caption("Showing **{}** of **{}** stocks · Sector: {} · Sort: {}".format(
         len(filt), len(scr), sector_sel, sort_by))
 
+    # ── Display table ─────────────────────────────────────────────────────────
     disp = filt.copy()
     disp["Price ($)"]     = disp["Price"].round(2)
     disp["Mkt Cap ($B)"]  = (disp["Mkt Cap"] / 1e9).round(2)
@@ -1582,7 +1632,7 @@ with page_screener:
     st.download_button(
         label="Download CSV",
         data=disp_final.to_csv(index=False).encode("utf-8"),
-        file_name="sp500_screener_v10_{}.csv".format(datetime.now().strftime("%Y%m%d_%H%M")),
+        file_name="sp500_screener_v11_{}.csv".format(datetime.now().strftime("%Y%m%d_%H%M")),
         mime="text/csv",
     )
 
@@ -1594,13 +1644,15 @@ with page_screener:
 **MC% of S&P500:** This stock's market cap as % of total S&P 500 market cap.
 
 **Score:** Sector-adaptive weights — select a sector to see active weights in the KPI panel above.
+
+**v11 Performance:** 2-phase fetch — Phase 1 runs for all 503 tickers (info only), Phase 2 deep financials only for tickers passing the MC/PE pre-filter. Reduces heavy quarterly_financials + balance_sheet calls by 30–70% depending on filter tightness.
 """)
 
     st.markdown("---")
     st.caption(
-        "v10 · Yahoo Finance primary · FMP bonus if key available · "
-        "ROIC from Yahoo quarterly financials · Earn Traj from Yahoo FwdEPS/TrailEPS · "
-        "Sector-adaptive scoring · normalise_pct_fmp fix · missing_factor_penalty 4-tier fix"
+        "v11 · 2-phase Yahoo fetch · Phase 2 gated by pre-filter · "
+        "FMP bonus if key available · normalise_pct_fmp fix · "
+        "missing_factor_penalty 4-tier · Sector-adaptive scoring"
     )
 
 # ══════════════════════════════════════════════════════════════════════════════

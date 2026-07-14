@@ -1,20 +1,24 @@
-# screener_app.py  v11
+# screener_app.py  v12
 # ─────────────────────────────────────────────────────────────────────────────
-# v11 CHANGES from v10:
-#   1. 2-phase Yahoo fetch architecture:
-#      Phase 1 — fetch_yahoo_info_all(): .info + fast_info only for ALL 503
-#                tickers (2 HTTP calls per ticker, not 3)
-#      Phase 2 — fetch_yahoo_deep_financials(): quarterly_financials +
-#                quarterly_balance_sheet ONLY for tickers that survive the
-#                MC / PE pre-filter (reduces heavy calls by 30-70%)
-#   2. Filter widgets moved ABOVE data fetch so pre-filter can use them
-#   3. _pre_filter_tickers() gates Phase 2 using Phase 1 info + UI filters
-#   4. All v10 bug fixes preserved:
-#      - normalise_pct_fmp() unconditional ×100 for FMP TTM decimal fractions
-#      - missing_factor_penalty() 4-tier (0→1.00, 1→0.95, 2→0.85, 3+→0.70)
-#   5. All v9/v10 features preserved:
+# v12 CHANGES from v11:
+#   1. ROIC excess-cash netting fix:
+#      - Previously used total cash to net invested capital → inflated ROIC
+#        for cash-rich companies (Apple, Microsoft, Alphabet) by 10–20 pts
+#      - Now uses excess cash = max(0, cash − 2% of revenue TTM) as operating
+#        cash floor, matching conventional ROIC methodology
+#      - Falls back to total cash netting if revenue TTM unavailable
+#   2. Earn Trajectory both-negative EPS cap:
+#      - Previously: trail EPS=−$2, fwd EPS=−$0.50 → earn_traj=+0.75 (wrong)
+#      - Now: when both trailing and forward EPS are negative, earn_traj is
+#        capped at +0.30 (recovery-in-progress signal, not quality growth)
+#      - Turnarounds (negative→positive EPS) still score up to +1.0
+#   3. All v11 features preserved:
+#      - 2-phase Yahoo fetch architecture (Phase 1 info / Phase 2 deep)
+#      - Pre-filter gating Phase 2 with MC/PE bounds
 #      - Sector-adaptive weights, Financials ROE override, ROIC computation
-#      - Earn Traj, FMP bonus layer, Conviction Score, Reference Guide
+#      - FMP bonus layer, Conviction Score, Reference Guide
+#      - normalise_pct_fmp() unconditional ×100 fix
+#      - missing_factor_penalty() 4-tier (0→1.00, 1→0.95, 2→0.85, 3+→0.70)
 # ─────────────────────────────────────────────────────────────────────────────
 
 import streamlit as st
@@ -99,6 +103,10 @@ QUALITY_THRESHOLDS = {
     "int_coverage_min": 3.0,
     "op_margin_min":    5.0,
 }
+
+# Operating cash as % of revenue used to compute excess cash for ROIC netting.
+# Conventional estimate: companies need ~2% of revenue as minimum working cash.
+OPERATING_CASH_PCT_OF_REV = 0.02
 
 # ── Credentials ───────────────────────────────────────────────────────────────
 def get_fmp_key():
@@ -362,11 +370,18 @@ def _fetch_yahoo_info_one(t):
         if eg_y is not None:
             result["eps_growth"] = eg_y * 100.0
 
+        # ── Earn Trajectory (v12 fix: cap both-negative EPS at +0.30) ─────────
         fwd_eps_val   = sf(info.get("forwardEps"))
         trail_eps_val = sf(info.get("trailingEps"))
         if fwd_eps_val is not None and trail_eps_val is not None and abs(trail_eps_val) > 0.01:
-            earn_traj_raw       = (fwd_eps_val - trail_eps_val) / abs(trail_eps_val)
-            result["earn_traj"] = max(-1.0, min(1.0, earn_traj_raw))
+            earn_traj_raw = (fwd_eps_val - trail_eps_val) / abs(trail_eps_val)
+            clipped       = max(-1.0, min(1.0, earn_traj_raw))
+            # When both EPS values are negative the company is still losing
+            # money even if improving. Cap the signal to +0.30 to distinguish
+            # "recovery in progress" from genuine quality earnings growth.
+            if trail_eps_val < 0 and fwd_eps_val < 0:
+                clipped = min(clipped, 0.30)
+            result["earn_traj"] = clipped
 
         if result["mc"] is None:
             mc_y = sf(info.get("marketCap"))
@@ -444,7 +459,7 @@ def _fetch_yahoo_deep_one(t):
                 if int_ttm > 0 and ebit_ttm > 0:
                     result["int_coverage"] = min(float(ebit_ttm / int_ttm), 100.0)
 
-        # ── ROIC ──────────────────────────────────────────────────────────────
+        # ── ROIC (v12: excess cash netting instead of total cash) ─────────────
         if qfin is not None and not qfin.empty and bs is not None and not bs.empty:
             op_inc_row = next(
                 (nm for nm in ["Operating Income", "EBIT", "Ebit"] if nm in qfin.index),
@@ -501,8 +516,37 @@ def _fetch_yahoo_deep_one(t):
                     None,
                 )
 
+                # ── v12 FIX: Excess cash netting ─────────────────────────────
+                # Conventional ROIC nets only *excess* cash against invested
+                # capital. Companies need ~2% of revenue as operational working
+                # cash. Netting total cash (old v11 behaviour) inflates ROIC for
+                # cash-rich names like Apple, Microsoft, Alphabet by 10–20 pts.
+                #
+                # excess_cash = max(0, total_cash − 2% × revenue_TTM)
+                # Falls back to total cash netting if revenue TTM unavailable.
+                cash_use = 0
+                if cash_val is not None:
+                    rev_ttm = None
+                    try:
+                        rev_row = next(
+                            (nm for nm in ["Total Revenue", "Revenue"]
+                             if nm in qfin.index),
+                            None,
+                        )
+                        if rev_row:
+                            rev_ttm = float(qfin.loc[rev_row].dropna().head(4).sum())
+                    except Exception:
+                        rev_ttm = None
+
+                    if rev_ttm is not None and rev_ttm > 0:
+                        operating_cash_floor = OPERATING_CASH_PCT_OF_REV * rev_ttm
+                        cash_use = max(0.0, cash_val - operating_cash_floor)
+                    else:
+                        # Fallback: use total cash (same as v11)
+                        cash_use = cash_val
+                # ── end v12 FIX ───────────────────────────────────────────────
+
                 if equity_val is not None and debt_val is not None:
-                    cash_use         = cash_val if cash_val is not None else 0
                     invested_capital = equity_val + debt_val - cash_use
                     if invested_capital > 0 and nopat != 0:
                         roic_computed = (nopat / invested_capital) * 100.0
@@ -1184,7 +1228,9 @@ def render_reference_guide():
 **Formula:** `NOPAT / Invested Capital × 100`
 
 NOPAT = Operating Income × (1 − effective tax rate)
-Invested Capital = Equity + Debt − Cash
+Invested Capital = Equity + Debt − Excess Cash
+
+> **v12 note:** Excess Cash = max(0, Total Cash − 2% of Revenue TTM). Only cash above the 2% operational floor is netted out, preventing ROIC inflation for cash-rich companies like Apple and Microsoft.
 
 | ROIC | Assessment |
 |---|---|
@@ -1260,10 +1306,20 @@ Invested Capital = Equity + Debt − Cash
 ### Earn Traj — Earnings Trajectory
 **Formula:** `(Forward EPS − Trailing EPS) / |Trailing EPS|` clipped to [−1.0, +1.0]
 
+> **v12 note:** When both trailing EPS and forward EPS are negative, the signal is capped at **+0.30** (recovery-in-progress). This prevents a loss-making company that is merely losing *less* money from scoring as high as a genuinely profitable growth company.
+
+| Scenario | Earn Traj | Interpretation |
+|---|---|---|
+| Trail +$2.00 → Fwd +$2.50 | +0.25 | Healthy earnings growth |
+| Trail −$2.00 → Fwd +$1.00 | +1.0 | Full turnaround — high signal |
+| Trail −$2.00 → Fwd −$0.50 | +0.30 (capped) | Still losing, improving |
+| Trail +$2.00 → Fwd +$1.50 | −0.25 | Earnings under pressure |
+| Trail −$0.50 → Fwd −$1.00 | −1.0 | Deteriorating losses |
+
 | Range | Signal |
 |---|---|
-| +0.5 to +1.0 | Strong earnings recovery |
-| +0.1 to +0.3 | Moderate growth |
+| +0.5 to +1.0 | Strong earnings recovery / turnaround |
+| +0.1 to +0.3 | Moderate growth or loss recovery (capped) |
 | Near 0 | Flat — stable but no catalyst |
 | −0.1 to −0.3 | Earnings under pressure |
 | −0.5 to −1.0 | Significant deterioration expected |
@@ -1381,17 +1437,17 @@ Last four fiscal quarters of total revenue, newest first (USD billions).
 
     st.markdown("---")
     st.markdown(
-        "**Data sources v11:** Yahoo Finance (primary) · FMP bonus if key available · "
-        "ROIC from Yahoo quarterly financials (Phase 2 only) · Earn Traj from Yahoo FwdEPS/TrailEPS · "
-        "MC% computed across all S&P 500 constituents · Sector-adaptive scoring. "
-        "_Nothing here is financial advice._"
+        "**Data sources v12:** Yahoo Finance (primary) · FMP bonus if key available · "
+        "ROIC from Yahoo quarterly financials with excess-cash netting (Phase 2) · "
+        "Earn Traj both-negative cap at +0.30 · MC% computed across all S&P 500 constituents · "
+        "Sector-adaptive scoring. _Nothing here is financial advice._"
     )
 
 
 # ══════════════════════════════════════════════════════════════════════════════
 # APP ENTRY POINT
 # ══════════════════════════════════════════════════════════════════════════════
-st.set_page_config(page_title="S&P 500 Screener v11", layout="wide", page_icon="📊")
+st.set_page_config(page_title="S&P 500 Screener v12", layout="wide", page_icon="📊")
 st.markdown(
     "<style>"
     "div[data-testid='stDataFrame'] table{font-size:13px;}"
@@ -1400,10 +1456,10 @@ st.markdown(
     unsafe_allow_html=True,
 )
 
-st.markdown("## S&P 500 Fundamental Screener v11")
+st.markdown("## S&P 500 Fundamental Screener v12")
 st.caption(
-    "Yahoo-first · 2-phase fetch (info→deep) · ROIC from quarterly financials · "
-    "Earn Traj from FwdEPS/TrailEPS · MC% of S&P500 · Sector-Adaptive 5-factor scoring · "
+    "Yahoo-first · 2-phase fetch (info→deep) · ROIC excess-cash netting fix · "
+    "Earn Traj both-negative cap · Sector-Adaptive 5-factor scoring · "
     "FMP bonus layer if key available"
 )
 
@@ -1632,27 +1688,29 @@ with page_screener:
     st.download_button(
         label="Download CSV",
         data=disp_final.to_csv(index=False).encode("utf-8"),
-        file_name="sp500_screener_v11_{}.csv".format(datetime.now().strftime("%Y%m%d_%H%M")),
+        file_name="sp500_screener_v12_{}.csv".format(datetime.now().strftime("%Y%m%d_%H%M")),
         mime="text/csv",
     )
 
     st.markdown("""
 **PEG:** Price/Earnings-to-Growth. PEG < 1.0 = potentially undervalued for its growth rate. Only computed when EPS growth >= 5%.
 
-**Earn Traj:** (Forward EPS - Trailing EPS) / |Trailing EPS|. Positive = analysts expect earnings growth. +0.20 = ~20% EPS improvement forecast.
+**Earn Traj:** (Forward EPS - Trailing EPS) / |Trailing EPS|. Positive = analysts expect earnings growth. +0.20 = ~20% EPS improvement forecast. When both EPS values are negative, capped at +0.30 (recovery-in-progress, not quality growth).
 
 **MC% of S&P500:** This stock's market cap as % of total S&P 500 market cap.
 
 **Score:** Sector-adaptive weights — select a sector to see active weights in the KPI panel above.
 
-**v11 Performance:** 2-phase fetch — Phase 1 runs for all 503 tickers (info only), Phase 2 deep financials only for tickers passing the MC/PE pre-filter. Reduces heavy quarterly_financials + balance_sheet calls by 30–70% depending on filter tightness.
+**ROIC:** Uses excess cash netting (total cash minus 2% of revenue TTM as operating floor) to prevent inflation for cash-rich large-caps.
+
+**v12 Performance:** 2-phase fetch architecture preserved. Two bug fixes: excess cash ROIC netting + Earn Traj both-negative EPS cap.
 """)
 
     st.markdown("---")
     st.caption(
-        "v11 · 2-phase Yahoo fetch · Phase 2 gated by pre-filter · "
-        "FMP bonus if key available · normalise_pct_fmp fix · "
-        "missing_factor_penalty 4-tier · Sector-adaptive scoring"
+        "v12 · ROIC excess-cash netting fix · Earn Traj both-negative cap · "
+        "2-phase Yahoo fetch · FMP bonus if key available · "
+        "normalise_pct_fmp fix · missing_factor_penalty 4-tier · Sector-adaptive scoring"
     )
 
 # ══════════════════════════════════════════════════════════════════════════════

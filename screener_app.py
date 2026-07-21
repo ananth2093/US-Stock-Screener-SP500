@@ -1,25 +1,4 @@
-<!DOCTYPE html>
-<html lang="en">
-<head>
-<meta charset="UTF-8">
-<title>screener_app.py v18</title>
-<style>
-  body { background:#0d0d0d; color:#e2e8f0; font-family:'Courier New',monospace; font-size:13px; line-height:1.6; margin:0; padding:24px 32px; }
-  pre { white-space:pre-wrap; word-break:break-word; }
-  .kw  { color:#c084fc; }
-  .fn  { color:#38bdf8; }
-  .st  { color:#86efac; }
-  .cm  { color:#6b7280; font-style:italic; }
-  .nb  { color:#fbbf24; }
-  .num { color:#fb923c; }
-  .new { background:rgba(74,222,128,0.08); border-left:3px solid #4ade80; padding:0 8px; display:inline-block; width:calc(100% - 16px); }
-  .fix { background:rgba(251,191,36,0.07); border-left:3px solid #fbbf24; padding:0 8px; display:inline-block; width:calc(100% - 16px); }
-</style>
-</head>
-<body>
-<pre id="code"></pre>
-<script>
-const raw = `# screener_app.py v18
+# screener_app.py v18
 # ─────────────────────────────────────────────────────────────────────────────
 # Phase-1 & Phase-2 gap fixes applied on top of v17 patches:
 #
@@ -2122,9 +2101,4 @@ with page_screener:
 
 with page_reference:
     render_reference_guide()
-`;
 
-document.getElementById('code').textContent = raw;
-</script>
-</body>
-</html>

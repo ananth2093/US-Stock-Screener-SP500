@@ -65,6 +65,10 @@
 #    • Piotroski F-Score, Sloan Ratio, Gross Margin, FCF Yield,
 #      EV/EBITDA, compute_valuation_subscore (v16)
 #    • All data-fetch concurrency, FMP integration, ROIC computation
+#
+#  FIX: Safe rounding — all .round(2) calls now use pd.to_numeric(...,
+#       errors='coerce') first to handle mixed-type columns (None, pd.NA,
+#       strings mixed with floats) that caused TypeError in pandas map_infer.
 # ─────────────────────────────────────────────────────────────────────────────
 
 import streamlit as st
@@ -143,8 +147,8 @@ DEFAULT_FACTOR_WEIGHTS = {
     "earn_traj": 0.15, "momentum": 0.15,
 }
 
-ROE_PRIMARY_SECTORS      = {"Financials"}
-QUALITY_THRESHOLDS       = {"roic_min": 8.0, "int_coverage_min": 3.0, "op_margin_min": 5.0}
+ROE_PRIMARY_SECTORS       = {"Financials"}
+QUALITY_THRESHOLDS        = {"roic_min": 8.0, "int_coverage_min": 3.0, "op_margin_min": 5.0}
 OPERATING_CASH_PCT_OF_REV = 0.02
 
 
@@ -235,6 +239,18 @@ def revenue_growth_pct_cagr(rev4):
         return ((q4 / q1) ** (1 / 3) - 1) * 100.0
     except Exception:
         return None
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# SAFE ROUNDING HELPER  ← FIX for TypeError in pandas map_infer
+# ══════════════════════════════════════════════════════════════════════════════
+def safe_round(series: pd.Series, decimals: int = 2) -> pd.Series:
+    """
+    Round a Series that may contain mixed types (None, pd.NA, strings,
+    integers, floats).  Converts to float first via pd.to_numeric so that
+    non-numeric values become NaN instead of raising TypeError.
+    """
+    return pd.to_numeric(series, errors="coerce").round(decimals)
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -334,9 +350,9 @@ def compute_elite_momentum(closes: pd.Series, price: float,
     """
     monthly = closes.resample("ME").last().dropna()
     components = {
-        "skip_month_raw":  None,
-        "hi52_proximity":  None,
-        "vs_ma200":        None,
+        "skip_month_raw":   None,
+        "hi52_proximity":   None,
+        "vs_ma200":         None,
         "rel_strength_spy": None,
     }
 
@@ -361,7 +377,7 @@ def compute_elite_momentum(closes: pd.Series, price: float,
     t_vol = (float(daily_rets.std() * np.sqrt(252) * 100.0)
              if len(daily_rets) >= 15 else None)
     if r6 is not None and r1 is not None:
-        skip_raw = r6 - r1
+        skip_raw  = r6 - r1
         raw_score = skip_raw / t_vol if (t_vol and t_vol > 0) else skip_raw
         s1 = float(np.clip(raw_score / 2.0, -1.0, 1.0))
     components["skip_month_raw"] = s1
@@ -429,8 +445,8 @@ def fetch_spy_3mo_return():
         monthly = closes.resample("ME").last().dropna()
         if len(monthly) < 4:
             return None
-        px_now  = float(monthly.iloc[-1])
-        px_3m   = float(monthly.iloc[-4])
+        px_now = float(monthly.iloc[-1])
+        px_3m  = float(monthly.iloc[-4])
         if px_3m <= 0:
             return None
         return (px_now / px_3m - 1) * 100.0
@@ -476,7 +492,7 @@ def compute_conviction_scores_elite(scr: pd.DataFrame) -> pd.DataFrame:
     scr["_completeness"] = scr.apply(completeness, axis=1)
 
     # Pre-compute sector median P/E for D2 valuation signal
-    sector_med_pe_map    = scr.groupby("Sector")["P/E"].median().to_dict()
+    sector_med_pe_map     = scr.groupby("Sector")["P/E"].median().to_dict()
     scr["_sector_med_pe"] = scr["Sector"].map(sector_med_pe_map)
 
     # D2: Signal agreement
@@ -722,7 +738,7 @@ def compute_quality_score_elite(
 def compute_valuation_subscore(elig: pd.DataFrame) -> pd.Series:
     scores = pd.DataFrame(index=elig.index); weights = []
     if "FCF Yield%" in elig.columns and elig["FCF Yield%"].notna().sum() >= 5:
-        scores["fcf"]     = elite_factor_score(elig["FCF Yield%"], ascending=False)
+        scores["fcf"]      = elite_factor_score(elig["FCF Yield%"], ascending=False)
         weights.append(("fcf", 0.40))
     if "EV/EBITDA" in elig.columns and elig["EV/EBITDA"].notna().sum() >= 5:
         scores["evebitda"] = elite_factor_score(elig["EV/EBITDA"], ascending=True)
@@ -765,14 +781,14 @@ def fetch_sp500_constituents():
 # ══════════════════════════════════════════════════════════════════════════════
 def _fetch_price_momentum_one(t, spy_3mo=None):
     result = {
-        "price":           None, "hi52": None, "lo52": None,
-        "ret_1mo":         None, "ret_3mo": None, "ret_6mo": None,
-        "trailing_vol":    None,
+        "price":            None, "hi52": None, "lo52": None,
+        "ret_1mo":          None, "ret_3mo": None, "ret_6mo": None,
+        "trailing_vol":     None,
         # v17 composite replaces the single skip-month score
-        "momentum_score":  None,   # composite (used in scoring)
-        "skip_month_raw":  None,   # individual sub-score display
-        "hi52_proximity":  None,
-        "vs_ma200":        None,
+        "momentum_score":   None,   # composite (used in scoring)
+        "skip_month_raw":   None,   # individual sub-score display
+        "hi52_proximity":   None,
+        "vs_ma200":         None,
         "rel_strength_spy": None,
     }
     try:
@@ -1913,13 +1929,13 @@ with page_screener:
         "EPS Surprise: {}/{} ({:.0f}%) · Revision Mom: {}/{} ({:.0f}%) · "
         "Momentum: {}/{} ({:.0f}%) · "
         "Yahoo{}".format(
-            cov_m("pe"),              total_t, cov_m("pe")              / total_t * 100,
-            cov_m("fwd_pe"),          total_t, cov_m("fwd_pe")          / total_t * 100,
-            cov_m("ev_ebitda"),       total_t, cov_m("ev_ebitda")       / total_t * 100,
-            cov_m("fcf_ttm"),         total_t, cov_m("fcf_ttm")         / total_t * 100,
-            cov_m("eps_surprise_avg"),total_t, cov_m("eps_surprise_avg")/ total_t * 100,
-            cov_m("revision_momentum"),total_t,cov_m("revision_momentum")/total_t * 100,
-            cov_p("momentum_score"),  total_t, cov_p("momentum_score")  / total_t * 100,
+            cov_m("pe"),               total_t, cov_m("pe")               / total_t * 100,
+            cov_m("fwd_pe"),           total_t, cov_m("fwd_pe")           / total_t * 100,
+            cov_m("ev_ebitda"),        total_t, cov_m("ev_ebitda")        / total_t * 100,
+            cov_m("fcf_ttm"),          total_t, cov_m("fcf_ttm")          / total_t * 100,
+            cov_m("eps_surprise_avg"), total_t, cov_m("eps_surprise_avg") / total_t * 100,
+            cov_m("revision_momentum"),total_t, cov_m("revision_momentum")/ total_t * 100,
+            cov_p("momentum_score"),   total_t, cov_p("momentum_score")   / total_t * 100,
             " + FMP" if fmp_key else "",
         )
     )
@@ -1973,15 +1989,18 @@ with page_screener:
     st.caption("Showing **{}** of **{}** · Sector: {} · Sort: {}".format(
         len(filt), len(scr), sector_sel, sort_by))
 
-    # Display
+    # ── Display prep ───────────────────────────────────────────────────────
     disp = filt.copy()
-    disp["Price ($)"]          = disp["Price"].round(2)
-    disp["Mkt Cap ($B)"]       = (disp["Mkt Cap"] / 1e9).round(2)
-    disp["MC% of S&P500"]      = disp["MC% of S&P500"].round(4)
-    disp["Rev Q1 Oldest ($B)"] = (disp["Rev Q1 Oldest ($B)"] / 1e9).round(2)
-    disp["Rev Q2 ($B)"]        = (disp["Rev Q2 ($B)"]         / 1e9).round(2)
-    disp["Rev Q3 ($B)"]        = (disp["Rev Q3 ($B)"]         / 1e9).round(2)
-    disp["Rev Q4 Latest ($B)"] = (disp["Rev Q4 Latest ($B)"]  / 1e9).round(2)
+
+    # ── Fixed: use safe_round() for all numeric columns ────────────────────
+    # Columns that are guaranteed pure float after to_num() in build step
+    disp["Price ($)"]          = safe_round(disp["Price"], 2)
+    disp["Mkt Cap ($B)"]       = safe_round(disp["Mkt Cap"] / 1e9, 2)
+    disp["MC% of S&P500"]      = safe_round(disp["MC% of S&P500"], 4)
+    disp["Rev Q1 Oldest ($B)"] = safe_round(disp["Rev Q1 Oldest ($B)"] / 1e9, 2)
+    disp["Rev Q2 ($B)"]        = safe_round(disp["Rev Q2 ($B)"]         / 1e9, 2)
+    disp["Rev Q3 ($B)"]        = safe_round(disp["Rev Q3 ($B)"]         / 1e9, 2)
+    disp["Rev Q4 Latest ($B)"] = safe_round(disp["Rev Q4 Latest ($B)"]  / 1e9, 2)
 
     disp["Quality Flag"] = disp.apply(
         lambda r: quality_flag(
@@ -1991,19 +2010,23 @@ with page_screener:
         ), axis=1,
     )
 
-    for c in [
-        "P/E","Fwd P/E","PEG","Earn Traj","52W Pos%",
-        "ROIC%","ROE%","Int Coverage","Op Margin%","Debt/Eq",
-        "Quality Score","Momentum Score","Ret 1Mo%","Ret 3Mo%",
-        "Ret 6Mo%","Trailing Vol%","Score","Conviction Score","CS Score",
-        "Rev Growth% (CAGR)","P/E vs Sector Med",
-        "EV/EBITDA","FCF Yield%","EV/Sales","Div Yield%","Sloan Ratio",
-        "EPS Surp Avg%","EPS Beat Rate","EPS Surp Trend","Revision Mom",
-        "Skip Mo","52W Prox","vs MA200","Rel Str SPY","Score Δ",
-    ]:
+    # All remaining numeric display columns — safe_round handles mixed types
+    ROUND_COLS = [
+        "P/E", "Fwd P/E", "PEG", "Earn Traj", "52W Pos%",
+        "ROIC%", "ROE%", "Int Coverage", "Op Margin%", "Debt/Eq",
+        "Quality Score", "Momentum Score", "Ret 1Mo%", "Ret 3Mo%",
+        "Ret 6Mo%", "Trailing Vol%", "Score", "Conviction Score", "CS Score",
+        "Rev Growth% (CAGR)", "P/E vs Sector Med",
+        "EV/EBITDA", "FCF Yield%", "EV/Sales", "Div Yield%", "Sloan Ratio",
+        "EPS Surp Avg%", "EPS Beat Rate", "EPS Surp Trend", "Revision Mom",
+        "Skip Mo", "52W Prox", "vs MA200", "Rel Str SPY", "Score Δ",
+    ]
+    for c in ROUND_COLS:
         if c in disp.columns:
-            disp[c] = disp[c].round(2)
+            disp[c] = safe_round(disp[c], 2)
 
+    # Rank: integer or pd.NA — coerce then display as nullable int
+    disp["Rank"] = pd.to_numeric(disp["Rank"], errors="coerce")
     disp["Rank"] = disp["Rank"].apply(
         lambda v: int(v) if pd.notna(v) else pd.NA)
 

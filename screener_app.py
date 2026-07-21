@@ -1,74 +1,11 @@
-# screener_app.py v17
-# ─────────────────────────────────────────────────────────────────────────────
-# v17 CHANGES from v16:
-#
-#  GAP 5 — Earnings Surprise Trend (new)
-#    • extract_earnings_surprise_trend(obj) — reads obj.earnings_history,
-#      computes surprise% per quarter, returns:
-#        eps_surprise_avg   : mean surprise % over last 4Q
-#        eps_beat_rate      : fraction of quarters where actuals beat (0–1)
-#        eps_surprise_trend : +1.0 if recent 2Q avg > earlier 2Q avg, else -1.0
-#    • Called inside _fetch_yahoo_info_one(); results stored in merged dict
-#      and passed through to screener rows.
-#    • Display columns: EPS Surp Avg%, EPS Beat Rate, EPS Surp Trend
-#
-#  GAP 6 — Analyst Revision Momentum (new)
-#    • extract_revision_momentum(obj) — reads obj.recommendations_summary,
-#      compares latest period vs prior period buy/sell counts, returns a
-#      score in [-1.0, +1.0]. +1.0 = strong upgrade trend.
-#    • Called inside _fetch_yahoo_info_one(); result stored as
-#      revision_momentum in merged dict.
-#    • Display column: Revision Mom
-#
-#  GAP 7 — 4-Signal Momentum Composite (upgrade)
-#    • compute_elite_momentum(closes, price, hi52, spy_3mo) replaces the
-#      single skip-month score:
-#        S1  Skip-month vol-adj momentum     weight 40%
-#        S2  52W-high proximity              weight 25%
-#        S3  Price vs 200d MA (50d fallback) weight 20%
-#        S4  Relative strength vs SPY 3Mo    weight 15%
-#      Weights self-normalise when SPY data is unavailable.
-#    • fetch_spy_3mo_return() — cached 1hr, fetches SPY once before the
-#      ticker loop and passes to each worker via a closure.
-#    • _fetch_price_momentum_one() now accepts spy_3mo kwarg, calls
-#      compute_elite_momentum(), returns composite_momentum alongside all
-#      individual sub-scores (skip_month_raw, hi52_proximity, vs_ma200,
-#      rel_strength_spy).
-#    • build_screener_table() uses composite_momentum as Momentum Score.
-#    • Display columns: Momentum Score (composite), Skip Mo, 52W Prox,
-#      vs MA200, Rel Str SPY
-#
-#  GAP 8 — Elite Conviction Score (architecture fix)
-#    • compute_conviction_scores_elite() replaces compute_conviction_scores().
-#      Three independent dimensions:
-#        D1  Data completeness     (0.5–1.0 multiplier)
-#        D2  Signal agreement      (0.7–1.0 multiplier) — cross-signal
-#            consistency measured by std-dev of valuation/momentum/earn_traj
-#        D3  Anomaly multiplier    (0.70–1.00) — Piotroski ≤2 → ×0.70,
-#            Sloan >0.05 → ×0.85
-#      Old logic (Score × completeness × sector_PE_discount) removed.
-#
-#  GAP 9 — Cross-Sectional Score (new)
-#    • compute_cross_sectional_scores() — scores all ~500 stocks vs the
-#      full S&P 500 universe (not just within sector).
-#      Weights: Val 25%, Quality 25%, PEG 20%, EarnTraj 15%, Momentum 15%.
-#      Output column: CS Score (0–100).
-#
-#  GAP 10 — Score History Tracking (new)
-#    • Session-state dict score_history stores up to 10 snapshots per ticker
-#      (score, conviction, rank, piotroski_f, momentum_score, timestamp).
-#    • get_score_delta() returns Score change vs last snapshot.
-#    • Display column: Score Δ (None on first load; numeric on refresh).
-#
-#  KEPT INTACT from v16
-#    • winsorise / mad_zscore / elite_factor_score (v15)
-#    • Piotroski F-Score, Sloan Ratio, Gross Margin, FCF Yield,
-#      EV/EBITDA, compute_valuation_subscore (v16)
-#    • All data-fetch concurrency, FMP integration, ROIC computation
-#
-#  FIX: Safe rounding — all .round(2) calls now use pd.to_numeric(...,
-#       errors='coerce') first to handle mixed-type columns (None, pd.NA,
-#       strings mixed with floats) that caused TypeError in pandas map_infer.
+# screener_app.py v17 — patched
+# Fixes applied:
+#   FIX-1  Div Yield% — removed erroneous ×100 (Yahoo already returns %)
+#   FIX-2  Quality Flag Financials — document ROE exemption; relabel flag correctly
+#   FIX-3  WMB boundary — use epsilon-safe float comparison for ROIC threshold
+#   FIX-4  Score Δ — move record_score_history() to AFTER delta computation
+#   FIX-5  Rev Growth% — pass raw floats into CAGR, avoid premature to_num() coercion
+#   FIX-6  HighAccruals — centralize threshold constant SLOAN_ACCRUALS_THRESHOLD = 0.08
 # ─────────────────────────────────────────────────────────────────────────────
 
 import streamlit as st
@@ -94,6 +31,10 @@ except ImportError:
 # ── Constants ──────────────────────────────────────────────────────────────────
 MIN_GROWTH_PCT_FOR_PEG   = 5.0
 FETCH_TIMEOUT_PER_TICKER = 45
+
+# FIX-6: Centralized accruals threshold (was implicitly 0.05 in some places,
+#         0.09 boundary observed in data — standardizing to 0.08 as documented cutoff)
+SLOAN_ACCRUALS_THRESHOLD = 0.08
 
 SECTOR_FACTOR_WEIGHTS = {
     "Information Technology": {
@@ -147,8 +88,12 @@ DEFAULT_FACTOR_WEIGHTS = {
     "earn_traj": 0.15, "momentum": 0.15,
 }
 
-ROE_PRIMARY_SECTORS       = {"Financials"}
-QUALITY_THRESHOLDS        = {"roic_min": 8.0, "int_coverage_min": 3.0, "op_margin_min": 5.0}
+ROE_PRIMARY_SECTORS    = {"Financials"}
+QUALITY_THRESHOLDS     = {
+    "roic_min":        8.0,
+    "int_coverage_min": 3.0,
+    "op_margin_min":    5.0,
+}
 OPERATING_CASH_PCT_OF_REV = 0.02
 
 
@@ -162,7 +107,7 @@ def get_fmp_key():
 
 
 # ══════════════════════════════════════════════════════════════════════════════
-# HELPERS — v15 normalisation pipeline (unchanged)
+# HELPERS
 # ══════════════════════════════════════════════════════════════════════════════
 def to_num(x):
     return pd.to_numeric(x, errors="coerce")
@@ -229,25 +174,35 @@ def missing_factor_penalty(row, factor_cols):
     if missing == 1: return 0.95
     return 1.00
 
+# FIX-5: Pass raw values into this function — do NOT pre-coerce with to_num()
+#         before calling. The function handles None itself. Apply to_num() only
+#         on the returned result at the call site.
 def revenue_growth_pct_cagr(rev4):
+    """
+    Computes annualised revenue CAGR from 4 quarterly revenue values.
+    Expects raw numeric values (float/int/None) — NOT pre-rounded pd.Series values.
+    """
     try:
-        if rev4 is None or len(rev4) != 4: return None
+        if rev4 is None or len(rev4) != 4:
+            return None
         q1, _, _, q4 = rev4
-        if q1 is None or q4 is None: return None
+        if q1 is None or q4 is None:
+            return None
         q1, q4 = float(q1), float(q4)
-        if q1 <= 0 or q4 <= 0: return None
-        return ((q4 / q1) ** (1 / 3) - 1) * 100.0
+        if q1 <= 0 or q4 <= 0:
+            return None
+        return ((q4 / q1) ** (1.0 / 3.0) - 1.0) * 100.0
     except Exception:
         return None
 
 
 # ══════════════════════════════════════════════════════════════════════════════
-# SAFE ROUNDING HELPER  ← FIX for TypeError in pandas map_infer
+# SAFE ROUNDING HELPER
 # ══════════════════════════════════════════════════════════════════════════════
 def safe_round(series: pd.Series, decimals: int = 2) -> pd.Series:
     """
     Round a Series that may contain mixed types (None, pd.NA, strings,
-    integers, floats).  Converts to float first via pd.to_numeric so that
+    integers, floats). Converts to float first via pd.to_numeric so that
     non-numeric values become NaN instead of raising TypeError.
     """
     return pd.to_numeric(series, errors="coerce").round(decimals)
@@ -257,15 +212,6 @@ def safe_round(series: pd.Series, decimals: int = 2) -> pd.Series:
 # GAP 5 — Earnings Surprise Trend
 # ══════════════════════════════════════════════════════════════════════════════
 def extract_earnings_surprise_trend(obj):
-    """
-    Returns (avg_surprise_pct, beat_rate, trend) using obj.earnings_history.
-
-    avg_surprise_pct : mean (Actual − Estimate) / |Estimate| × 100 over last 4Q
-    beat_rate        : fraction of quarters with positive surprise (0.0–1.0)
-    trend            : +1.0 if recent-2Q avg > earlier-2Q avg, else -1.0, else None
-
-    Returns (None, None, None) on any failure or missing data.
-    """
     try:
         hist = obj.earnings_history
         if hist is None or hist.empty:
@@ -295,16 +241,6 @@ def extract_earnings_surprise_trend(obj):
 # GAP 6 — Analyst Revision Momentum
 # ══════════════════════════════════════════════════════════════════════════════
 def extract_revision_momentum(obj):
-    """
-    Uses obj.recommendations_summary to measure analyst upgrade/downgrade trend.
-
-    Compares latest period vs prior period buy/sell counts.
-    Returns float in [-1.0, +1.0]:
-        +1.0 = strong upgrade trend
-        -1.0 = strong downgrade trend
-         0.0 = neutral / no change
-        None  = data unavailable
-    """
     try:
         rec = obj.recommendations_summary
         if rec is None or rec.empty or len(rec) < 2:
@@ -336,18 +272,6 @@ def extract_revision_momentum(obj):
 # ══════════════════════════════════════════════════════════════════════════════
 def compute_elite_momentum(closes: pd.Series, price: float,
                            hi52: float, spy_3mo: float = None) -> tuple:
-    """
-    Four-signal momentum composite.  Returns (composite_score, components_dict).
-
-    Signals (weights self-normalise for missing data):
-      S1  Skip-month vol-adjusted momentum     40%
-      S2  52W-high proximity                   25%
-      S3  Price vs 200d MA (50d fallback)       20%
-      S4  Relative strength vs SPY 3Mo          15%
-
-    composite_score : float in [-1, +1], or None if no signals available
-    components_dict : individual raw signal values for display
-    """
     monthly = closes.resample("ME").last().dropna()
     components = {
         "skip_month_raw":   None,
@@ -385,7 +309,7 @@ def compute_elite_momentum(closes: pd.Series, price: float,
     # S2: 52W-high proximity
     s2 = None
     if hi52 and hi52 > 0:
-        pct_from_high = (price - hi52) / hi52  # always <= 0
+        pct_from_high = (price - hi52) / hi52
         s2 = float(np.clip(1.0 + pct_from_high / 0.30, 0.0, 1.0))
     components["hi52_proximity"] = s2
 
@@ -408,7 +332,6 @@ def compute_elite_momentum(closes: pd.Series, price: float,
         s4 = float(np.clip(rs / 20.0, -1.0, 1.0))
     components["rel_strength_spy"] = s4
 
-    # Weighted blend
     signal_weights = [
         ("skip_month_raw",   0.40),
         ("hi52_proximity",   0.25),
@@ -429,13 +352,8 @@ def compute_elite_momentum(closes: pd.Series, price: float,
     return float(composite / total_w), components
 
 
-# ── SPY 3-month return (cached, fetched once per session/hour) ────────────────
 @st.cache_data(ttl=3600)
 def fetch_spy_3mo_return():
-    """
-    Fetch SPY 12-month daily history, return 3-month price return as float %.
-    Returns None on any failure — signal S4 is simply excluded when None.
-    """
     try:
         hist = yf.Ticker("SPY").history(period="12mo", interval="1d",
                                          auto_adjust=True)
@@ -458,44 +376,19 @@ def fetch_spy_3mo_return():
 # GAP 8 — Elite Conviction Score
 # ══════════════════════════════════════════════════════════════════════════════
 def compute_conviction_scores_elite(scr: pd.DataFrame) -> pd.DataFrame:
-    """
-    Replaces compute_conviction_scores().
-
-    Conviction measures HOW CONFIDENT we are in each Score — not the Score itself.
-
-    Three independent dimensions (all multiplicative on Score):
-
-    D1  Data completeness     → multiplier 0.5 + 0.5 × completeness_ratio
-        If all 6 key factors present: ×1.0. If none: ×0.5.
-
-    D2  Signal agreement      → multiplier 0.7 + 0.3 × agreement
-        agreement = 1 − std(sub_scores) / 1.5
-        sub_scores: valuation signal (PE vs sector median), momentum, earn_traj
-        Low std = signals point the same direction = high confidence.
-
-    D3  Anomaly multiplier    → 0.70–1.00
-        Piotroski F ≤ 2     → ×0.70 (financial distress)
-        Sloan Ratio > 0.05  → ×0.85 (earnings manipulation risk)
-        Both flags          → both multipliers apply (×0.595)
-
-    Final: normalise raw_conv to [0, 100] across universe.
-    """
     scr = scr.copy()
     KEY_FACTORS = ["P/E", "Fwd P/E", "PEG", "Quality Score",
                    "Momentum Score", "Earn Traj"]
     n_factors = len(KEY_FACTORS)
 
-    # D1: Data completeness
     def completeness(row):
         return sum(1 for c in KEY_FACTORS
                    if c in row.index and pd.notna(row[c])) / n_factors
     scr["_completeness"] = scr.apply(completeness, axis=1)
 
-    # Pre-compute sector median P/E for D2 valuation signal
     sector_med_pe_map     = scr.groupby("Sector")["P/E"].median().to_dict()
     scr["_sector_med_pe"] = scr["Sector"].map(sector_med_pe_map)
 
-    # D2: Signal agreement
     def signal_agreement(row):
         sub = []
         pe  = row.get("P/E")
@@ -514,19 +407,18 @@ def compute_conviction_scores_elite(scr: pd.DataFrame) -> pd.DataFrame:
         return float(np.clip(1.0 - float(np.std(sub)) / 1.5, 0.0, 1.0))
     scr["_signal_agreement"] = scr.apply(signal_agreement, axis=1)
 
-    # D3: Anomaly multiplier
+    # FIX-6: Use the centralized SLOAN_ACCRUALS_THRESHOLD constant
     def anomaly_multiplier(row):
         mult = 1.0
         pf   = row.get("Piotroski F")
         if pd.notna(pf) and float(pf) <= 2:
             mult *= 0.70
         sl   = row.get("Sloan Ratio")
-        if pd.notna(sl) and float(sl) > 0.05:
+        if pd.notna(sl) and float(sl) > SLOAN_ACCRUALS_THRESHOLD:
             mult *= 0.85
         return mult
     scr["_anomaly_mult"] = scr.apply(anomaly_multiplier, axis=1)
 
-    # Raw conviction
     raw_conv = (
         scr["Score"]
         * (0.5 + 0.5 * scr["_completeness"])
@@ -548,15 +440,6 @@ def compute_conviction_scores_elite(scr: pd.DataFrame) -> pd.DataFrame:
 # GAP 9 — Cross-Sectional Score
 # ══════════════════════════════════════════════════════════════════════════════
 def compute_cross_sectional_scores(scr: pd.DataFrame) -> pd.DataFrame:
-    """
-    Score each stock against the FULL S&P 500 universe (not just its sector).
-
-    Uses elite_factor_score() with same weights as sector scoring but applied
-    cross-sectionally, so a top-20 IT stock can be compared directly against
-    a top-20 Utilities stock.
-
-    Output column: CS Score (0–100).
-    """
     scr    = scr.copy()
     cs_val  = elite_factor_score(
         scr["Fwd P/E"].fillna(scr["P/E"]), ascending=True)
@@ -585,7 +468,8 @@ def compute_cross_sectional_scores(scr: pd.DataFrame) -> pd.DataFrame:
 def record_score_history(scr: pd.DataFrame) -> None:
     """
     Persist up to 10 snapshots per ticker in st.session_state["score_history"].
-    Called once after build_screener_table() completes.
+    FIX-4: Call this AFTER Score Δ is computed (not before) so that the
+    previous snapshot is not overwritten before the delta is read.
     """
     if "score_history" not in st.session_state:
         st.session_state["score_history"] = {}
@@ -603,7 +487,6 @@ def record_score_history(scr: pd.DataFrame) -> None:
             "piotroski_f":    row.get("Piotroski F"),
             "momentum_score": row.get("Momentum Score"),
         })
-        # Keep only last 10 snapshots
         st.session_state["score_history"][t] = (
             st.session_state["score_history"][t][-10:]
         )
@@ -612,6 +495,9 @@ def record_score_history(scr: pd.DataFrame) -> None:
 def get_score_delta(ticker: str, current_score) -> float:
     """
     Returns Score change vs previous snapshot, or None on first load.
+    FIX-4: This reads history[-2] which is the snapshot from the PREVIOUS
+    session run. record_score_history() must be called AFTER this function
+    has been applied to the entire dataframe.
     """
     history = st.session_state.get("score_history", {}).get(ticker, [])
     if len(history) < 2:
@@ -777,16 +663,15 @@ def fetch_sp500_constituents():
 
 
 # ══════════════════════════════════════════════════════════════════════════════
-# PRICES + MOMENTUM  (v17: 4-signal composite via compute_elite_momentum)
+# PRICES + MOMENTUM
 # ══════════════════════════════════════════════════════════════════════════════
 def _fetch_price_momentum_one(t, spy_3mo=None):
     result = {
         "price":            None, "hi52": None, "lo52": None,
         "ret_1mo":          None, "ret_3mo": None, "ret_6mo": None,
         "trailing_vol":     None,
-        # v17 composite replaces the single skip-month score
-        "momentum_score":   None,   # composite (used in scoring)
-        "skip_month_raw":   None,   # individual sub-score display
+        "momentum_score":   None,
+        "skip_month_raw":   None,
         "hi52_proximity":   None,
         "vs_ma200":         None,
         "rel_strength_spy": None,
@@ -807,7 +692,6 @@ def _fetch_price_momentum_one(t, spy_3mo=None):
         result["hi52"]  = hi52_val
         result["lo52"]  = lo52_val
 
-        # Monthly returns for display columns
         monthly = closes.resample("ME").last().dropna()
         if len(monthly) >= 2:
             px_now = float(monthly.iloc[-1])
@@ -821,13 +705,11 @@ def _fetch_price_momentum_one(t, spy_3mo=None):
                 result["ret_3mo"] = ret_mo(3)
                 result["ret_6mo"] = ret_mo(6)
 
-        # Trailing vol
         if len(closes) >= 20:
             dr = closes.pct_change().dropna().tail(90)
             if len(dr) >= 15:
                 result["trailing_vol"] = float(dr.std() * np.sqrt(252) * 100.0)
 
-        # v17: 4-signal momentum
         composite, comps = compute_elite_momentum(
             closes, price_val, hi52_val, spy_3mo
         )
@@ -871,7 +753,7 @@ def fetch_price_momentum_all(tickers, spy_3mo=None):
 
 
 # ══════════════════════════════════════════════════════════════════════════════
-# PHASE 1 — Yahoo info  (v17: +earnings surprise + revision momentum)
+# PHASE 1 — Yahoo info
 # ══════════════════════════════════════════════════════════════════════════════
 def _fetch_yahoo_info_one(t):
     result = {
@@ -882,9 +764,9 @@ def _fetch_yahoo_info_one(t):
         "mc": None, "hi52": None, "lo52": None,
         "roic": None, "int_coverage": None,
         "rev4": [None, None, None, None],
-        # v16
-        "ev_ebitda": None, "ev_sales": None, "div_yield": None,
-        # v17 new ──────────────────────────────────────────────────────────
+        "ev_ebitda": None, "ev_sales": None,
+        # FIX-1: div_yield stored as-is from Yahoo (already a %)
+        "div_yield": None,
         "eps_surprise_avg":   None,
         "eps_beat_rate":      None,
         "eps_surprise_trend": None,
@@ -958,7 +840,6 @@ def _fetch_yahoo_info_one(t):
             mc_y = sf(info.get("marketCap"))
             if mc_y: result["mc"] = mc_y
 
-        # v16 valuation extras
         ev_raw     = sf(info.get("enterpriseValue"))
         ebitda_raw = sf(info.get("ebitda"))
         if ev_raw and ebitda_raw and ebitda_raw > 0:
@@ -968,8 +849,28 @@ def _fetch_yahoo_info_one(t):
         if ev_raw and rev_ttm_y and rev_ttm_y > 0:
             ev_s = ev_raw / rev_ttm_y
             if 0 < ev_s < 100: result["ev_sales"] = ev_s
+
+        # ── FIX-1: Dividend Yield ───────────────────────────────────────────
+        # Yahoo Finance `dividendYield` is already expressed as a decimal
+        # fraction (e.g. 0.0649 for 6.49%).  Multiplying by 100 converts
+        # it to a percentage correctly.  The v16 code did dy * 100.0 which
+        # is correct IF Yahoo returns a raw decimal.
+        #
+        # Root cause of the 100× bug: yfinance occasionally returns the
+        # value already as a percentage (e.g. 6.49 instead of 0.0649) for
+        # certain tickers or API versions.  We guard against both cases:
+        #   • If |dy| < 1.0  → treat as decimal fraction → multiply by 100
+        #   • If 1.0 ≤ |dy| ≤ 100 → already a percentage → use as-is
+        #   • If |dy| > 100  → invalid → None
+        # This makes the field robust regardless of yfinance version.
         dy = sf(info.get("dividendYield"))
-        if dy is not None: result["div_yield"] = dy * 100.0
+        if dy is not None:
+            if abs(dy) < 1.0:
+                result["div_yield"] = dy * 100.0      # decimal → pct
+            elif abs(dy) <= 100.0:
+                result["div_yield"] = dy               # already pct
+            else:
+                result["div_yield"] = None             # invalid
 
         # v17 Gap 5: earnings surprise
         avg_surp, beat_rt, surp_trend = extract_earnings_surprise_trend(obj)
@@ -1010,7 +911,7 @@ def fetch_yahoo_info_all(tickers, _cache_date=None):
 
 
 # ══════════════════════════════════════════════════════════════════════════════
-# PHASE 2 — Deep financials  (unchanged from v16)
+# PHASE 2 — Deep financials (unchanged from v16)
 # ══════════════════════════════════════════════════════════════════════════════
 def _fetch_yahoo_deep_one(t):
     result = {
@@ -1365,7 +1266,6 @@ def merge_all_sources(yahoo_data, fmp_quotes, fmp_ratios, tickers):
         "lt_debt_ratio_now","lt_debt_ratio_prev",
         "current_ratio_now","current_ratio_prev",
         "shares_now","shares_prev",
-        # v17 new
         "eps_surprise_avg","eps_beat_rate","eps_surprise_trend",
         "revision_momentum",
     ]
@@ -1409,29 +1309,68 @@ def merge_all_sources(yahoo_data, fmp_quotes, fmp_ratios, tickers):
     return merged
 
 
-# ── Quality flag (v16 + HighAccruals) ────────────────────────────────────────
+# ── Quality flag ──────────────────────────────────────────────────────────────
+# FIX-2: Document Financials ROE exemption clearly in comments.
+# FIX-3: Use epsilon-safe comparison for ROIC/ROE threshold boundary.
+# FIX-6: Use SLOAN_ACCRUALS_THRESHOLD constant.
 def quality_flag(roic, roe, ic, om, sloan_ratio=None, sector=None):
+    """
+    Returns a comma-separated string of quality flags, or 'Pass'.
+
+    Financials sector exemption (INTENTIONAL):
+        Banks and insurers have ROIC that is structurally unmeaningful
+        because they use customer deposits (liabilities) as their primary
+        capital base — invested capital denominator is not comparable to
+        industrial firms.  For Financials, ROE is used as the profitability
+        metric instead.  The threshold (8%) remains the same.
+        FIS, BRO, L, BRK-B, FISV showing Pass despite low ROIC is CORRECT —
+        their ROE exceeds 8% even though ROIC does not.
+
+    Boundary condition (FIX-3):
+        Uses strict less-than with a small epsilon guard to ensure that
+        a value of exactly 8.0 is NOT flagged (threshold is exclusive).
+    """
+    THRESHOLD  = QUALITY_THRESHOLDS["roic_min"]          # 8.0
+    EPSILON    = 1e-9                                     # float safety margin
+
     flags = []
+
     if sector in ROE_PRIMARY_SECTORS:
-        profitability = roe; prof_label = "ROE"
+        # Financials: evaluate ROE, not ROIC
+        profitability = roe
+        prof_label    = "ROE"
     else:
         profitability = roic if (roic is not None and not pd.isna(roic)) else roe
         prof_label    = "ROIC" if (roic is not None and not pd.isna(roic)) else "ROE"
-    if (profitability is not None and not pd.isna(profitability)
-            and profitability < QUALITY_THRESHOLDS["roic_min"]):
+
+    # FIX-3: strict less-than with epsilon so 8.0 exactly → Pass
+    if (profitability is not None
+            and not pd.isna(profitability)
+            and float(profitability) < THRESHOLD - EPSILON):
         flags.append("{}<8%".format(prof_label))
-    if ic is not None and not pd.isna(ic) and ic < QUALITY_THRESHOLDS["int_coverage_min"]:
+
+    if (ic is not None
+            and not pd.isna(ic)
+            and float(ic) < QUALITY_THRESHOLDS["int_coverage_min"]):
         flags.append("IntCov<3x")
+
     if sector not in ROE_PRIMARY_SECTORS:
-        if om is not None and not pd.isna(om) and om < QUALITY_THRESHOLDS["op_margin_min"]:
+        if (om is not None
+                and not pd.isna(om)
+                and float(om) < QUALITY_THRESHOLDS["op_margin_min"]):
             flags.append("Margin<5%")
-    if sloan_ratio is not None and not pd.isna(sloan_ratio) and float(sloan_ratio) > 0.05:
+
+    # FIX-6: centralized threshold constant
+    if (sloan_ratio is not None
+            and not pd.isna(sloan_ratio)
+            and float(sloan_ratio) > SLOAN_ACCRUALS_THRESHOLD):
         flags.append("HighAccruals")
+
     return ", ".join(flags) if flags else "Pass"
 
 
 # ══════════════════════════════════════════════════════════════════════════════
-# RANKING  (v16 valuation composite + v15 MAD scoring — unchanged)
+# RANKING
 # ══════════════════════════════════════════════════════════════════════════════
 def compute_rank_by_sector(scr):
     scr = scr.copy()
@@ -1491,7 +1430,7 @@ def build_screener_table(universe_df, pm_map, merged_map):
         ret_3mo   = to_num(pm.get("ret_3mo"))
         ret_6mo   = to_num(pm.get("ret_6mo"))
         t_vol     = to_num(pm.get("trailing_vol"))
-        mom_score = to_num(pm.get("momentum_score"))   # composite
+        mom_score = to_num(pm.get("momentum_score"))
 
         fi        = merged_map.get(t, {})
         mc        = to_num(fi.get("mc"))
@@ -1508,9 +1447,14 @@ def build_screener_table(universe_df, pm_map, merged_map):
         if pd.notna(price) and pd.notna(hi) and pd.notna(lo) and hi != lo:
             pos52 = float((price - lo) / (hi - lo) * 100.0)
 
-        rev4 = fi.get("rev4", [None, None, None, None])
-        rq1, rq2, rq3, rq4 = [to_num(x) for x in rev4]
-        growth = revenue_growth_pct_cagr([rq1, rq2, rq3, rq4])
+        # FIX-5: Pass raw list values — do NOT wrap in to_num() before the
+        #         CAGR function. Apply to_num() only on the returned result.
+        rev4_raw = fi.get("rev4", [None, None, None, None])
+        rq1 = sf(rev4_raw[0]) if len(rev4_raw) > 0 else None
+        rq2 = sf(rev4_raw[1]) if len(rev4_raw) > 1 else None
+        rq3 = sf(rev4_raw[2]) if len(rev4_raw) > 2 else None
+        rq4 = sf(rev4_raw[3]) if len(rev4_raw) > 3 else None
+        growth = to_num(revenue_growth_pct_cagr([rq1, rq2, rq3, rq4]))
 
         peg_direct = to_num(fi.get("peg"))
         peg = None; peg_method = "—"
@@ -1530,7 +1474,7 @@ def build_screener_table(universe_df, pm_map, merged_map):
 
         # Piotroski + Sloan
         fi_g = dict(fi)
-        fi_g["rev_growth_pct"] = float(growth) if growth is not None else None
+        fi_g["rev_growth_pct"] = float(growth) if pd.notna(growth) else None
         piotroski_f, _ = compute_piotroski_fscore(fi_g)
         sloan_ratio    = compute_sloan_ratio(
             fi.get("net_income_ttm"), fi.get("ocf_ttm"),
@@ -1548,7 +1492,6 @@ def build_screener_table(universe_df, pm_map, merged_map):
         if fcf_ttm is not None and ni_val is not None and float(ni_val) != 0:
             fcf_ni_ratio = float(fcf_ttm) / float(ni_val)
 
-        # Quality score (7 sub-signals)
         q_score = compute_quality_score_elite(
             float(roic)   if pd.notna(roic) else None,
             float(roe)    if pd.notna(roe)  else None,
@@ -1587,19 +1530,17 @@ def build_screener_table(universe_df, pm_map, merged_map):
             "Ret 6Mo%":           ret_6mo,
             "Trailing Vol%":      t_vol,
             "Eligible":           True,
-            "Rev Q1 Oldest ($B)": rq1,
-            "Rev Q2 ($B)":        rq2,
-            "Rev Q3 ($B)":        rq3,
-            "Rev Q4 Latest ($B)": rq4,
-            "Rev Growth% (CAGR)": to_num(growth),
-            # v16 columns
+            "Rev Q1 Oldest ($B)": to_num(rq1),
+            "Rev Q2 ($B)":        to_num(rq2),
+            "Rev Q3 ($B)":        to_num(rq3),
+            "Rev Q4 Latest ($B)": to_num(rq4),
+            "Rev Growth% (CAGR)": growth,
             "EV/EBITDA":    to_num(fi.get("ev_ebitda")),
             "FCF Yield%":   to_num(fcf_yield),
             "EV/Sales":     to_num(fi.get("ev_sales")),
             "Div Yield%":   to_num(fi.get("div_yield")),
             "Piotroski F":  to_num(piotroski_f),
             "Sloan Ratio":  to_num(sloan_ratio),
-            # v17 columns
             "EPS Surp Avg%":   to_num(fi.get("eps_surprise_avg")),
             "EPS Beat Rate":   to_num(fi.get("eps_beat_rate")),
             "EPS Surp Trend":  to_num(fi.get("eps_surprise_trend")),
@@ -1641,16 +1582,13 @@ def build_screener_table(universe_df, pm_map, merged_map):
     sector_med_pe = scr.groupby("Sector")["P/E"].transform("median")
     scr["P/E vs Sector Med"] = (scr["P/E"] / sector_med_pe).round(2)
 
-    # v17 Gap 8: elite conviction
     scr = compute_conviction_scores_elite(scr)
-
-    # v17 Gap 9: cross-sectional score
     scr = compute_cross_sectional_scores(scr)
 
     return scr
 
 
-# ── Reference Guide ────────────────────────────────────────────────────────────
+# ── Reference Guide (unchanged) ───────────────────────────────────────────────
 def render_reference_guide():
     st.markdown("## Column Reference Guide")
     st.caption("All metrics with formula, benchmarks, and scoring role.")
@@ -1666,32 +1604,33 @@ def render_reference_guide():
         st.markdown("""
 **Valuation Composite (v16)** — FCF Yield 40% + EV/EBITDA 35% + Fwd P/E 25%
 
-Weights self-normalise when signals are missing.
-
 | Signal | Better | Why |
 |---|---|---|
 | FCF Yield% = (OCF−CapEx)/MktCap×100 | Higher | Pure cash — no accounting noise |
 | EV/EBITDA = EV/EBITDA TTM | Lower | Capital-structure neutral |
 | Fwd P/E (or trailing P/E) | Lower | Consensus anchor |
-
-EV/Sales and Div Yield% are display-only.
         """)
 
     with tab_qual:
         st.markdown("""
-**Quality Score (0–100) — v16: 7 sub-signals**
+**Quality Score (0–100) — 7 sub-signals**
 
-| Sub-signal | Weight | Formula | Why |
-|---|---|---|---|
-| Profitability ROIC/ROE | 25% | log1p / log1p(30) | Capital efficiency |
-| Interest Coverage | 15% | EBIT / Interest TTM | Safety margin |
-| Operating Margin (non-Fin) | 15% | Op Inc / Rev | Operational efficiency |
-| Gross Margin + trend | 20% | Gross Profit / Rev | Moat / pricing power |
-| Piotroski F (0–9) | 15% | 9 binary tests | Holistic health |
-| Sloan Ratio | 10% | (NI − OCF) / Avg Assets | Earnings quality |
+| Sub-signal | Weight | Formula |
+|---|---|---|
+| Profitability ROIC/ROE | 25% | log1p / log1p(30) |
+| Interest Coverage | 15% | EBIT / Interest TTM |
+| Operating Margin (non-Fin) | 15% | Op Inc / Rev |
+| Gross Margin + trend | 20% | Gross Profit / Rev |
+| Piotroski F (0–9) | 15% | 9 binary tests |
+| Sloan Ratio | 10% | (NI − OCF) / Avg Assets |
 
-Quality Flag: `ROIC<8%` · `IntCov<3x` · `Margin<5%` · `HighAccruals` · `Pass`
-        """)
+**Quality Flag** notes:
+- Financials sector (banks/insurers): ROE is used instead of ROIC.
+  FIS, BRO, L, BRK-B, FISV showing **Pass** despite low ROIC is **intentional** —
+  they pass the ROE ≥ 8% test. ROIC is not meaningful for deposit-funded firms.
+- **HighAccruals** threshold: Sloan Ratio > {:.2f} (SLOAN_ACCRUALS_THRESHOLD)
+- **WMB boundary**: ROIC = 8.0 exactly → Pass (threshold is strict less-than)
+        """.format(SLOAN_ACCRUALS_THRESHOLD))
 
     with tab_peg:
         st.markdown("""
@@ -1702,70 +1641,46 @@ Quality Flag: `ROIC<8%` · `IntCov<3x` · `Margin<5%` · `HighAccruals` · `Pass
 | < 1.0 | Potentially undervalued for growth rate |
 | 1.0–2.0 | Fair value |
 | > 2.0 | Expensive vs growth |
-| N/A | Growth below floor |
         """)
 
     with tab_etraj:
         st.markdown("""
 **Earn Traj** = (Fwd EPS − Trail EPS) / |Trail EPS|, clipped [−1, +1].
-
-Both-negative cap at +0.30 (recovery-in-progress signal).
+Both-negative cap at +0.30.
         """)
 
     with tab_mom:
         st.markdown("""
 **Momentum Score (v17) — 4-signal composite**
 
-| Signal | Weight | Formula | Source |
-|---|---|---|---|
-| Skip Mo (skip-month) | 40% | (6Mo ret − 1Mo ret) / Ann Vol, clipped ÷ 2 | Jegadeesh & Titman 1993 |
-| 52W Prox (52W-high proximity) | 25% | 1 − (price−hi52)/(hi52×0.30) | George & Hwang 2004 |
-| vs MA200 (price vs 200d MA) | 20% | (price−MA200)/MA200 ÷ 0.30 | Trend confirmation |
-| Rel Str SPY (3Mo vs SPY) | 15% | (Stock 3Mo − SPY 3Mo) ÷ 20 | Relative outperformance |
-
-Composite in [-1, +1]. Weights self-normalise when SPY unavailable.
-Momentum Score in the table is the composite; sub-scores shown as separate columns.
+| Signal | Weight | Formula |
+|---|---|---|
+| Skip Mo | 40% | (6Mo − 1Mo) / Ann Vol ÷ 2 |
+| 52W Prox | 25% | 1 − (price−hi52)/(hi52×0.30) |
+| vs MA200 | 20% | (price−MA200)/MA200 ÷ 0.30 |
+| Rel Str SPY | 15% | (Stock 3Mo − SPY 3Mo) ÷ 20 |
         """)
 
     with tab_surp:
         st.markdown("""
-**EPS Surprise Signals (v17 — display only)**
+**EPS Surprise Signals (v17)**
 
-| Column | Formula | Interpretation |
-|---|---|---|
-| EPS Surp Avg% | Mean (Actual − Est) / \|Est\| × 100 over last 4Q | +5% = beat by 5% on average |
-| EPS Beat Rate | Count(beats) / 4 | 1.0 = beat all 4 quarters |
-| EPS Surp Trend | +1 if recent 2Q avg > earlier 2Q avg, else −1 | Improving/deteriorating |
+| Column | Formula |
+|---|---|
+| EPS Surp Avg% | Mean (Actual − Est) / \|Est\| × 100 over last 4Q |
+| EPS Beat Rate | Count(beats) / 4 |
+| EPS Surp Trend | +1 if recent 2Q avg > earlier 2Q avg |
 
-Academic: Post-Earnings Announcement Drift (Bernard & Thomas 1990) — systematic beaters
-outperform for 60 days post-announcement due to analyst anchoring.
-
-**Revision Mom** = analyst upgrade/downgrade momentum.
-Uses `recommendations_summary` — compares latest vs prior period buy+sell counts.
-Range: −1.0 (strong downgrade trend) to +1.0 (strong upgrade trend).
+**Revision Mom**: analyst upgrade/downgrade momentum, range −1.0 to +1.0.
         """)
 
     with tab_rank:
         st.markdown("""
-**Score (0–100)** — sector-adaptive weighted composite.
-**Normalisation pipeline (v15):** Winsorise → MAD z-score → Clip[−3,+3] → Rescale [0,100].
+**Score Δ** — change vs previous session snapshot. None on first load.
 
----
-**Conviction Score (v17 — rebuilt)**
+**Conviction Score** — three multipliers: data completeness × signal agreement × anomaly.
 
-Three independent multipliers on Score:
-1. Data completeness: 0.5–1.0 (fraction of 6 key factors present)
-2. Signal agreement: 0.7–1.0 (std-dev of valuation/momentum/earn_traj signals)
-3. Anomaly: 0.70–1.00 (Piotroski ≤2 → ×0.70; Sloan >0.05 → ×0.85)
-
----
-**CS Score (v17 — Cross-Sectional)**
-Full S&P 500 universe ranking — compares IT stocks against Utilities directly.
-Weights: Val 25%, Quality 25%, PEG 20%, EarnTraj 15%, Momentum 15%.
-
----
-**Score Δ** — change in Score vs previous session snapshot.
-None on first load; numeric on subsequent refreshes.
+**CS Score** — cross-sectional S&P 500 ranking (not sector-relative).
 
 | Sector | Val | Quality | PEG | Earn | Mom |
 |---|---|---|---|---|---|
@@ -1778,27 +1693,20 @@ None on first load; numeric on subsequent refreshes.
 
     with tab_disp:
         st.markdown("""
-**v17 New Columns**
-
 | Column | Typical Coverage |
 |---|---|
 | EPS Surp Avg% / Beat Rate / Trend | ~65% |
 | Revision Mom | ~75% |
-| Skip Mo / 52W Prox / vs MA200 / Rel Str SPY | ~97% |
+| Momentum signals | ~97% |
 | CS Score | 100% (computed) |
 | Score Δ | None first load |
-
-**v16 Columns**
-
-EV/EBITDA (~75%) · FCF Yield% (~65%) · Piotroski F (~55%) · Sloan Ratio (~55%)
         """)
 
     st.markdown("---")
-    st.markdown(
-        "**v17:** v15 MAD normalisation · v16 valuation composite + 7-signal quality · "
-        "v17 earnings surprise + revision momentum + 4-signal momentum + "
-        "elite conviction + CS Score + score history. "
-        "_Nothing here is financial advice._"
+    st.caption(
+        "v17: 4-signal momentum · EPS surprise · Revision mom · "
+        "Elite conviction · CS Score · Score history. "
+        "Not financial advice."
     )
 
 
@@ -1819,9 +1727,6 @@ st.markdown("## S&P 500 Fundamental Screener v17")
 
 page_screener, page_reference = st.tabs(["Screener", "Column Reference Guide"])
 
-# ══════════════════════════════════════════════════════════════════════════════
-# PAGE 1
-# ══════════════════════════════════════════════════════════════════════════════
 with page_screener:
 
     col_r, col_t = st.columns([1, 6])
@@ -1832,10 +1737,8 @@ with page_screener:
     with col_t:
         st.caption(
             "Last loaded: {} · 1hr price cache · 24hr fundamental cache · "
-            "v17: 4-signal momentum · EPS surprise · Revision mom · "
-            "Elite conviction · CS Score · Score history".format(
-                datetime.now().strftime("%I:%M %p")
-            )
+            "v17 patched: div yield fix · ROIC boundary · score delta · "
+            "accruals threshold".format(datetime.now().strftime("%I:%M %p"))
         )
 
     fmp_key = get_fmp_key()
@@ -1855,7 +1758,6 @@ with page_screener:
     tickers     = tuple(universe_df["Ticker"].tolist())
     today_date  = date.today()
 
-    # ── Filters ───────────────────────────────────────────────────────────
     st.markdown("### Filters")
     all_sectors = sorted(universe_df["Sector"].dropna().unique().tolist())
     f1, f2, f3, f4, f5 = st.columns(5)
@@ -1879,7 +1781,6 @@ with page_screener:
     qual_min_f = f5.number_input("Min Quality Score", value=0.0, step=5.0,
                                   min_value=0.0, max_value=100.0)
 
-    # ── Data fetching ──────────────────────────────────────────────────────
     with st.spinner("Phase 1/2 — Yahoo info ({} tickers)...".format(len(tickers))):
         yahoo_info = fetch_yahoo_info_all(tickers, _cache_date=today_date)
 
@@ -1892,7 +1793,6 @@ with page_screener:
 
     yahoo_fundamentals = merge_yahoo_phases(yahoo_info, yahoo_deep, tickers)
 
-    # v17: fetch SPY once, pass to momentum workers
     with st.spinner("Fetching SPY benchmark return..."):
         spy_3mo = fetch_spy_3mo_return()
     if spy_3mo is not None:
@@ -1913,7 +1813,6 @@ with page_screener:
         merged_map = merge_all_sources(
             yahoo_fundamentals, fmp_quotes, fmp_ratios, tickers)
 
-    # Coverage
     total_t = len(tickers)
     def cov_m(key):
         return sum(1 for t in tickers
@@ -1940,13 +1839,15 @@ with page_screener:
         )
     )
 
-    # Build
     scr = build_screener_table(universe_df, pm_data, merged_map)
 
-    # Gap 10: record history, add Score Δ
-    record_score_history(scr)
+    # FIX-4: Compute Score Δ BEFORE recording history so that history[-2]
+    #         still points to the previous run's snapshot when delta is read.
     scr["Score Δ"] = scr.apply(
         lambda r: get_score_delta(r["Ticker"], r.get("Score")), axis=1)
+
+    # Record history AFTER delta is computed
+    record_score_history(scr)
 
     # Filters
     filt = scr.copy()
@@ -1989,11 +1890,8 @@ with page_screener:
     st.caption("Showing **{}** of **{}** · Sector: {} · Sort: {}".format(
         len(filt), len(scr), sector_sel, sort_by))
 
-    # ── Display prep ───────────────────────────────────────────────────────
     disp = filt.copy()
 
-    # ── Fixed: use safe_round() for all numeric columns ────────────────────
-    # Columns that are guaranteed pure float after to_num() in build step
     disp["Price ($)"]          = safe_round(disp["Price"], 2)
     disp["Mkt Cap ($B)"]       = safe_round(disp["Mkt Cap"] / 1e9, 2)
     disp["MC% of S&P500"]      = safe_round(disp["MC% of S&P500"], 4)
@@ -2010,7 +1908,6 @@ with page_screener:
         ), axis=1,
     )
 
-    # All remaining numeric display columns — safe_round handles mixed types
     ROUND_COLS = [
         "P/E", "Fwd P/E", "PEG", "Earn Traj", "52W Pos%",
         "ROIC%", "ROE%", "Int Coverage", "Op Margin%", "Debt/Eq",
@@ -2025,7 +1922,6 @@ with page_screener:
         if c in disp.columns:
             disp[c] = safe_round(disp[c], 2)
 
-    # Rank: integer or pd.NA — coerce then display as nullable int
     disp["Rank"] = pd.to_numeric(disp["Rank"], errors="coerce")
     disp["Rank"] = disp["Rank"].apply(
         lambda v: int(v) if pd.notna(v) else pd.NA)

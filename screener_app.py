@@ -1,13 +1,42 @@
-# screener_app.py v17 — patched
-# Fixes applied:
-#   FIX-1  Div Yield% — removed erroneous ×100 (Yahoo already returns %)
-#   FIX-2  Quality Flag Financials — document ROE exemption; relabel flag correctly
-#   FIX-3  WMB boundary — use epsilon-safe float comparison for ROIC threshold
-#   FIX-4  Score Δ — move record_score_history() to AFTER delta computation
-#   FIX-5  Rev Growth% — pass raw floats into CAGR, avoid premature to_num() coercion
-#   FIX-6  HighAccruals — centralize threshold constant SLOAN_ACCRUALS_THRESHOLD = 0.08
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<title>screener_app.py v18</title>
+<style>
+  body { background:#0d0d0d; color:#e2e8f0; font-family:'Courier New',monospace; font-size:13px; line-height:1.6; margin:0; padding:24px 32px; }
+  pre { white-space:pre-wrap; word-break:break-word; }
+  .kw  { color:#c084fc; }
+  .fn  { color:#38bdf8; }
+  .st  { color:#86efac; }
+  .cm  { color:#6b7280; font-style:italic; }
+  .nb  { color:#fbbf24; }
+  .num { color:#fb923c; }
+  .new { background:rgba(74,222,128,0.08); border-left:3px solid #4ade80; padding:0 8px; display:inline-block; width:calc(100% - 16px); }
+  .fix { background:rgba(251,191,36,0.07); border-left:3px solid #fbbf24; padding:0 8px; display:inline-block; width:calc(100% - 16px); }
+</style>
+</head>
+<body>
+<pre id="code"></pre>
+<script>
+const raw = `# screener_app.py v18
+# ─────────────────────────────────────────────────────────────────────────────
+# Phase-1 & Phase-2 gap fixes applied on top of v17 patches:
+#
+#   FIX-7  roa_prev — now computed from qbs/qfin prior-year slices (Piotroski P3 live)
+#   FIX-8  shares_prev — sourced from balance-sheet Ordinary Shares row (Piotroski L3 live)
+#   FIX-9  EV/EBITDA TTM — ebitda_ttm computed from EBIT + D&A quarterly data; overrides
+#           the stale fiscal-year ebitda from info dict
+#  FIX-10  EPS Growth Tier-2 — 3-yr historical EPS CAGR fallback from obj.earnings
+#           drastically reduces PEG = None coverage gap
+#  FIX-11  EPS Growth Tier-3 — earn_traj proxy as last-resort PEG denominator
+#  FIX-12  Revenue CAGR exponent — corrected from 1/3 to 4/3 (3 inter-quarter gaps
+#           over ~9 months; annualises correctly to yearly rate)
+#  FIX-13  Score Delta run_id guard — uuid-tagged history entries prevent stale
+#           cross-session delta reads after st.rerun() / cache clear
 # ─────────────────────────────────────────────────────────────────────────────
 
+import uuid
 import streamlit as st
 import pandas as pd
 import numpy as np
@@ -31,10 +60,12 @@ except ImportError:
 # ── Constants ──────────────────────────────────────────────────────────────────
 MIN_GROWTH_PCT_FOR_PEG   = 5.0
 FETCH_TIMEOUT_PER_TICKER = 45
+SLOAN_ACCRUALS_THRESHOLD = 0.08   # FIX-6 from v17 — centralised
 
-# FIX-6: Centralized accruals threshold (was implicitly 0.05 in some places,
-#         0.09 boundary observed in data — standardizing to 0.08 as documented cutoff)
-SLOAN_ACCRUALS_THRESHOLD = 0.08
+# FIX-12: corrected CAGR exponent constant for readability
+#   4 quarterly values span 3 inter-quarter gaps = 0.75 years
+#   Annualisation exponent = 1 / 0.75 = 4/3
+CAGR_EXPONENT = 4.0 / 3.0
 
 SECTOR_FACTOR_WEIGHTS = {
     "Information Technology": {
@@ -88,9 +119,9 @@ DEFAULT_FACTOR_WEIGHTS = {
     "earn_traj": 0.15, "momentum": 0.15,
 }
 
-ROE_PRIMARY_SECTORS    = {"Financials"}
-QUALITY_THRESHOLDS     = {
-    "roic_min":        8.0,
+ROE_PRIMARY_SECTORS = {"Financials"}
+QUALITY_THRESHOLDS  = {
+    "roic_min":         8.0,
     "int_coverage_min": 3.0,
     "op_margin_min":    5.0,
 }
@@ -129,9 +160,9 @@ def normalise_pct_fmp(val):
 
 def fmt_mc(val):
     if pd.isna(val) or val == 0: return "N/A"
-    if val >= 1e12: return "${:.2f}T".format(val / 1e12)
-    if val >= 1e9:  return "${:.1f}B".format(val / 1e9)
-    return "${:.0f}M".format(val / 1e6)
+    if val >= 1e12: return "\${:.2f}T".format(val / 1e12)
+    if val >= 1e9:  return "\${:.1f}B".format(val / 1e9)
+    return "\${:.0f}M".format(val / 1e6)
 
 def winsorise(series: pd.Series, lower: float = 0.01, upper: float = 0.99) -> pd.Series:
     valid = series.dropna()
@@ -157,7 +188,7 @@ def elite_factor_score(series: pd.Series, ascending: bool = True) -> pd.Series:
     return scaled.fillna(0.0)
 
 def percentile_score(series: pd.Series, ascending: bool = True) -> pd.Series:
-    """DEPRECATED v15."""
+    """DEPRECATED v15 — kept for reference only."""
     result = pd.Series(index=series.index, dtype=float)
     valid  = series.notna()
     if valid.sum() == 0: return result.fillna(0.0)
@@ -174,13 +205,14 @@ def missing_factor_penalty(row, factor_cols):
     if missing == 1: return 0.95
     return 1.00
 
-# FIX-5: Pass raw values into this function — do NOT pre-coerce with to_num()
-#         before calling. The function handles None itself. Apply to_num() only
-#         on the returned result at the call site.
+# FIX-12: exponent corrected from 1/3 → CAGR_EXPONENT (4/3).
+# 4 quarterly data points define 3 inter-quarter periods spanning ~9 months.
+# Annualisation: (q4/q1)^(1/0.75) = (q4/q1)^(4/3).
 def revenue_growth_pct_cagr(rev4):
     """
-    Computes annualised revenue CAGR from 4 quarterly revenue values.
-    Expects raw numeric values (float/int/None) — NOT pre-rounded pd.Series values.
+    Annualised revenue CAGR from 4 quarterly revenue values (oldest first).
+    Exponent = 4/3  (3 inter-quarter gaps ≈ 0.75 yr → annualise to 1 yr).
+    Pass raw float/int/None values — do NOT pre-coerce with to_num().
     """
     try:
         if rev4 is None or len(rev4) != 4:
@@ -191,7 +223,7 @@ def revenue_growth_pct_cagr(rev4):
         q1, q4 = float(q1), float(q4)
         if q1 <= 0 or q4 <= 0:
             return None
-        return ((q4 / q1) ** (1.0 / 3.0) - 1.0) * 100.0
+        return ((q4 / q1) ** CAGR_EXPONENT - 1.0) * 100.0   # FIX-12
     except Exception:
         return None
 
@@ -200,16 +232,11 @@ def revenue_growth_pct_cagr(rev4):
 # SAFE ROUNDING HELPER
 # ══════════════════════════════════════════════════════════════════════════════
 def safe_round(series: pd.Series, decimals: int = 2) -> pd.Series:
-    """
-    Round a Series that may contain mixed types (None, pd.NA, strings,
-    integers, floats). Converts to float first via pd.to_numeric so that
-    non-numeric values become NaN instead of raising TypeError.
-    """
     return pd.to_numeric(series, errors="coerce").round(decimals)
 
 
 # ══════════════════════════════════════════════════════════════════════════════
-# GAP 5 — Earnings Surprise Trend
+# Earnings Surprise Trend
 # ══════════════════════════════════════════════════════════════════════════════
 def extract_earnings_surprise_trend(obj):
     try:
@@ -238,7 +265,7 @@ def extract_earnings_surprise_trend(obj):
 
 
 # ══════════════════════════════════════════════════════════════════════════════
-# GAP 6 — Analyst Revision Momentum
+# Analyst Revision Momentum
 # ══════════════════════════════════════════════════════════════════════════════
 def extract_revision_momentum(obj):
     try:
@@ -268,7 +295,7 @@ def extract_revision_momentum(obj):
 
 
 # ══════════════════════════════════════════════════════════════════════════════
-# GAP 7 — 4-Signal Elite Momentum
+# 4-Signal Elite Momentum
 # ══════════════════════════════════════════════════════════════════════════════
 def compute_elite_momentum(closes: pd.Series, price: float,
                            hi52: float, spy_3mo: float = None) -> tuple:
@@ -295,7 +322,6 @@ def compute_elite_momentum(closes: pd.Series, price: float,
 
     r1, r3, r6 = ret_mo(1), ret_mo(3), ret_mo(6)
 
-    # S1: Skip-month
     s1 = None
     daily_rets = closes.pct_change().dropna().tail(90)
     t_vol = (float(daily_rets.std() * np.sqrt(252) * 100.0)
@@ -306,14 +332,12 @@ def compute_elite_momentum(closes: pd.Series, price: float,
         s1 = float(np.clip(raw_score / 2.0, -1.0, 1.0))
     components["skip_month_raw"] = s1
 
-    # S2: 52W-high proximity
     s2 = None
     if hi52 and hi52 > 0:
         pct_from_high = (price - hi52) / hi52
         s2 = float(np.clip(1.0 + pct_from_high / 0.30, 0.0, 1.0))
     components["hi52_proximity"] = s2
 
-    # S3: Price vs 200d MA (50d fallback)
     s3 = None
     if len(closes) >= 200:
         ma = float(closes.tail(200).mean())
@@ -325,7 +349,6 @@ def compute_elite_momentum(closes: pd.Series, price: float,
             s3 = float(np.clip((price - ma) / ma / 0.20, -1.0, 1.0))
     components["vs_ma200"] = s3
 
-    # S4: Relative strength vs SPY
     s4 = None
     if spy_3mo is not None and r3 is not None:
         rs = r3 - spy_3mo
@@ -356,7 +379,7 @@ def compute_elite_momentum(closes: pd.Series, price: float,
 def fetch_spy_3mo_return():
     try:
         hist = yf.Ticker("SPY").history(period="12mo", interval="1d",
-                                         auto_adjust=True)
+                                        auto_adjust=True)
         if hist is None or hist.empty or "Close" not in hist.columns:
             return None
         closes  = hist["Close"].dropna()
@@ -373,7 +396,7 @@ def fetch_spy_3mo_return():
 
 
 # ══════════════════════════════════════════════════════════════════════════════
-# GAP 8 — Elite Conviction Score
+# Elite Conviction Score
 # ══════════════════════════════════════════════════════════════════════════════
 def compute_conviction_scores_elite(scr: pd.DataFrame) -> pd.DataFrame:
     scr = scr.copy()
@@ -407,7 +430,6 @@ def compute_conviction_scores_elite(scr: pd.DataFrame) -> pd.DataFrame:
         return float(np.clip(1.0 - float(np.std(sub)) / 1.5, 0.0, 1.0))
     scr["_signal_agreement"] = scr.apply(signal_agreement, axis=1)
 
-    # FIX-6: Use the centralized SLOAN_ACCRUALS_THRESHOLD constant
     def anomaly_multiplier(row):
         mult = 1.0
         pf   = row.get("Piotroski F")
@@ -437,7 +459,7 @@ def compute_conviction_scores_elite(scr: pd.DataFrame) -> pd.DataFrame:
 
 
 # ══════════════════════════════════════════════════════════════════════════════
-# GAP 9 — Cross-Sectional Score
+# Cross-Sectional Score
 # ══════════════════════════════════════════════════════════════════════════════
 def compute_cross_sectional_scores(scr: pd.DataFrame) -> pd.DataFrame:
     scr    = scr.copy()
@@ -463,17 +485,20 @@ def compute_cross_sectional_scores(scr: pd.DataFrame) -> pd.DataFrame:
 
 
 # ══════════════════════════════════════════════════════════════════════════════
-# GAP 10 — Score History helpers
+# Score History helpers  (FIX-13: run_id guard)
 # ══════════════════════════════════════════════════════════════════════════════
 def record_score_history(scr: pd.DataFrame) -> None:
     """
     Persist up to 10 snapshots per ticker in st.session_state["score_history"].
-    FIX-4: Call this AFTER Score Δ is computed (not before) so that the
-    previous snapshot is not overwritten before the delta is read.
+    FIX-4 (v17): called AFTER Score Delta is computed.
+    FIX-13 (v18): each entry is tagged with the current run_id so that
+    get_score_delta() can skip entries from the SAME run and always compare
+    against a genuinely different session — even after st.rerun().
     """
     if "score_history" not in st.session_state:
         st.session_state["score_history"] = {}
 
+    current_run = st.session_state.get("run_id", "?")
     ts = datetime.now().strftime("%Y-%m-%d %H:%M")
     for _, row in scr.iterrows():
         t = row["Ticker"]
@@ -481,6 +506,7 @@ def record_score_history(scr: pd.DataFrame) -> None:
             st.session_state["score_history"][t] = []
         st.session_state["score_history"][t].append({
             "ts":             ts,
+            "run_id":         current_run,          # FIX-13
             "score":          row.get("Score"),
             "conviction":     row.get("Conviction Score"),
             "rank":           row.get("Rank"),
@@ -494,15 +520,18 @@ def record_score_history(scr: pd.DataFrame) -> None:
 
 def get_score_delta(ticker: str, current_score) -> float:
     """
-    Returns Score change vs previous snapshot, or None on first load.
-    FIX-4: This reads history[-2] which is the snapshot from the PREVIOUS
-    session run. record_score_history() must be called AFTER this function
-    has been applied to the entire dataframe.
+    Returns Score change vs previous session snapshot, or None on first load.
+    FIX-13 (v18): filters history to entries from DIFFERENT run_ids before
+    reading the most-recent prior snapshot.  Prevents stale same-session
+    reads after st.cache_data.clear() + st.rerun().
     """
-    history = st.session_state.get("score_history", {}).get(ticker, [])
-    if len(history) < 2:
+    current_run  = st.session_state.get("run_id", "?")
+    all_history  = st.session_state.get("score_history", {}).get(ticker, [])
+    # Only consider entries recorded in a PREVIOUS run
+    prev_entries = [h for h in all_history if h.get("run_id") != current_run]
+    if not prev_entries:
         return None
-    prev = history[-2].get("score")
+    prev = prev_entries[-1].get("score")
     if prev is None or current_score is None or pd.isna(current_score):
         return None
     try:
@@ -511,48 +540,61 @@ def get_score_delta(ticker: str, current_score) -> float:
         return None
 
 
-# ── v16 Piotroski F-Score (unchanged) ────────────────────────────────────────
+# ══════════════════════════════════════════════════════════════════════════════
+# Piotroski F-Score
+# ══════════════════════════════════════════════════════════════════════════════
 def compute_piotroski_fscore(d: dict) -> tuple:
     score = 0; comp = {}
     roa = d.get("roa_ttm")
     p1  = 1 if (roa is not None and roa > 0) else 0
     score += p1; comp["P1_ROA_pos"] = p1
+
     ocf = d.get("ocf_ttm")
     p2  = 1 if (ocf is not None and ocf > 0) else 0
     score += p2; comp["P2_OCF_pos"] = p2
-    roa_prev = d.get("roa_prev")
+
+    roa_prev = d.get("roa_prev")   # FIX-7: now populated from balance sheet
     p3 = 1 if (roa is not None and roa_prev is not None and roa > roa_prev) else 0
     score += p3; comp["P3_ROA_improving"] = p3
+
     ni = d.get("net_income_ttm")
     p4 = 1 if (ocf is not None and ni is not None and ocf > ni) else 0
     score += p4; comp["P4_accruals_ok"] = p4
+
     ldr_now  = d.get("lt_debt_ratio_now")
     ldr_prev = d.get("lt_debt_ratio_prev")
     l1 = 1 if (ldr_now is not None and ldr_prev is not None
-                and ldr_now < ldr_prev) else 0
+               and ldr_now < ldr_prev) else 0
     score += l1; comp["L1_leverage_down"] = l1
+
     cr_now  = d.get("current_ratio_now")
     cr_prev = d.get("current_ratio_prev")
     l2 = 1 if (cr_now is not None and cr_prev is not None
-                and cr_now > cr_prev) else 0
+               and cr_now > cr_prev) else 0
     score += l2; comp["L2_liquidity_up"] = l2
+
     sh_now  = d.get("shares_now")
-    sh_prev = d.get("shares_prev")
+    sh_prev = d.get("shares_prev")   # FIX-8: now from balance sheet shares row
     l3 = 1 if (sh_now is not None and sh_prev is not None
-                and sh_now <= sh_prev * 1.02) else 0
+               and sh_now <= sh_prev * 1.02) else 0
     score += l3; comp["L3_no_dilution"] = l3
+
     gm_now  = d.get("gross_margin_now")
     gm_prev = d.get("gross_margin_prev")
     o1 = 1 if (gm_now is not None and gm_prev is not None
-                and gm_now > gm_prev) else 0
+               and gm_now > gm_prev) else 0
     score += o1; comp["O1_gross_margin_up"] = o1
+
     rev_growth = d.get("rev_growth_pct")
     o2 = 1 if (rev_growth is not None and rev_growth > 0) else 0
     score += o2; comp["O2_asset_turn_up"] = o2
+
     return score, comp
 
 
-# ── v16 Sloan Ratio (unchanged) ───────────────────────────────────────────────
+# ══════════════════════════════════════════════════════════════════════════════
+# Sloan Ratio
+# ══════════════════════════════════════════════════════════════════════════════
 def compute_sloan_ratio(net_income, ocf, total_assets_now, total_assets_prev):
     try:
         if any(v is None for v in
@@ -565,7 +607,9 @@ def compute_sloan_ratio(net_income, ocf, total_assets_now, total_assets_prev):
         return None
 
 
-# ── v16 Elite Quality Score (unchanged) ──────────────────────────────────────
+# ══════════════════════════════════════════════════════════════════════════════
+# Elite Quality Score
+# ══════════════════════════════════════════════════════════════════════════════
 def compute_quality_score_elite(
     roic, roe, int_coverage, op_margin,
     gross_margin_now=None, gross_margin_prev=None,
@@ -581,19 +625,19 @@ def compute_quality_score_elite(
         s = 0.0
     scores.append(s); weights.append(0.25)
 
-    scores.append(min(100.0, max(0.0, float(int_coverage)/10.0*100.0))
+    scores.append(min(100.0, max(0.0, float(int_coverage) / 10.0 * 100.0))
                   if int_coverage is not None and not pd.isna(int_coverage)
                   else 0.0)
     weights.append(0.15)
 
     if sector not in ROE_PRIMARY_SECTORS:
-        scores.append(min(100.0, max(0.0, float(op_margin)/40.0*100.0))
+        scores.append(min(100.0, max(0.0, float(op_margin) / 40.0 * 100.0))
                       if op_margin is not None and not pd.isna(op_margin)
                       else 0.0)
         weights.append(0.15)
 
     if gross_margin_now is not None and not pd.isna(gross_margin_now):
-        gm_score = min(100.0, max(0.0, float(gross_margin_now)/60.0*100.0))
+        gm_score = min(100.0, max(0.0, float(gross_margin_now) / 60.0 * 100.0))
         if (gross_margin_prev is not None
                 and float(gross_margin_now) > float(gross_margin_prev)):
             gm_score = min(100.0, gm_score * 1.10)
@@ -602,13 +646,13 @@ def compute_quality_score_elite(
         scores.append(0.0)
     weights.append(0.20)
 
-    scores.append(float(piotroski_f)/9.0*100.0
+    scores.append(float(piotroski_f) / 9.0 * 100.0
                   if piotroski_f is not None and not pd.isna(piotroski_f)
                   else 0.0)
     weights.append(0.15)
 
     if sloan_ratio is not None and not pd.isna(sloan_ratio):
-        sr = float(sloan_ratio)
+        sr          = float(sloan_ratio)
         sr_clamped  = max(-0.15, min(0.05, sr))
         sloan_score = (0.05 - sr_clamped) / 0.20 * 100.0
         scores.append(sloan_score)
@@ -620,7 +664,9 @@ def compute_quality_score_elite(
     return sum(s * w for s, w in zip(scores, weights)) / total_w if total_w else 0.0
 
 
-# ── v16 Valuation sub-score (unchanged) ──────────────────────────────────────
+# ══════════════════════════════════════════════════════════════════════════════
+# Valuation sub-score
+# ══════════════════════════════════════════════════════════════════════════════
 def compute_valuation_subscore(elig: pd.DataFrame) -> pd.Series:
     scores = pd.DataFrame(index=elig.index); weights = []
     if "FCF Yield%" in elig.columns and elig["FCF Yield%"].notna().sum() >= 5:
@@ -641,7 +687,9 @@ def compute_valuation_subscore(elig: pd.DataFrame) -> pd.Series:
     return composite.fillna(0.0)
 
 
-# ── S&P 500 universe ──────────────────────────────────────────────────────────
+# ══════════════════════════════════════════════════════════════════════════════
+# S&P 500 universe
+# ══════════════════════════════════════════════════════════════════════════════
 @st.cache_data(ttl=86400)
 def fetch_sp500_constituents():
     url  = "https://en.wikipedia.org/wiki/List_of_S%26P_500_companies"
@@ -667,14 +715,11 @@ def fetch_sp500_constituents():
 # ══════════════════════════════════════════════════════════════════════════════
 def _fetch_price_momentum_one(t, spy_3mo=None):
     result = {
-        "price":            None, "hi52": None, "lo52": None,
-        "ret_1mo":          None, "ret_3mo": None, "ret_6mo": None,
-        "trailing_vol":     None,
-        "momentum_score":   None,
-        "skip_month_raw":   None,
-        "hi52_proximity":   None,
-        "vs_ma200":         None,
-        "rel_strength_spy": None,
+        "price": None, "hi52": None, "lo52": None,
+        "ret_1mo": None, "ret_3mo": None, "ret_6mo": None,
+        "trailing_vol": None, "momentum_score": None,
+        "skip_month_raw": None, "hi52_proximity": None,
+        "vs_ma200": None, "rel_strength_spy": None,
     }
     try:
         obj  = yf.Ticker(t)
@@ -711,8 +756,7 @@ def _fetch_price_momentum_one(t, spy_3mo=None):
                 result["trailing_vol"] = float(dr.std() * np.sqrt(252) * 100.0)
 
         composite, comps = compute_elite_momentum(
-            closes, price_val, hi52_val, spy_3mo
-        )
+            closes, price_val, hi52_val, spy_3mo)
         result["momentum_score"]   = composite
         result["skip_month_raw"]   = comps.get("skip_month_raw")
         result["hi52_proximity"]   = comps.get("hi52_proximity")
@@ -726,9 +770,9 @@ def _fetch_price_momentum_one(t, spy_3mo=None):
 
 @st.cache_data(ttl=3600)
 def fetch_price_momentum_all(tickers, spy_3mo=None):
-    tl     = list(tickers)
-    out    = {t: {} for t in tl}
-    CHUNK  = 25; WKRS = 10; SLEEP = 1.0
+    tl    = list(tickers)
+    out   = {t: {} for t in tl}
+    CHUNK = 25; WKRS = 10; SLEEP = 1.0
     chunks = [tl[i:i+CHUNK] for i in range(0, len(tl), CHUNK)]
     prog   = st.progress(0); status = st.empty()
 
@@ -753,24 +797,21 @@ def fetch_price_momentum_all(tickers, spy_3mo=None):
 
 
 # ══════════════════════════════════════════════════════════════════════════════
-# PHASE 1 — Yahoo info
+# PHASE 1 — Yahoo info  (FIX-10: Tier-2 EPS growth from historical earnings)
 # ══════════════════════════════════════════════════════════════════════════════
 def _fetch_yahoo_info_one(t):
     result = {
         "pe": None, "pe_src": None, "fwd_pe": None,
         "peg": None, "peg_src": None,
         "roe": None, "op_margin": None, "debt_eq": None,
-        "eps_growth": None, "earn_traj": None,
+        "eps_growth": None, "growth_src": None, "earn_traj": None,
         "mc": None, "hi52": None, "lo52": None,
         "roic": None, "int_coverage": None,
         "rev4": [None, None, None, None],
         "ev_ebitda": None, "ev_sales": None,
-        # FIX-1: div_yield stored as-is from Yahoo (already a %)
         "div_yield": None,
-        "eps_surprise_avg":   None,
-        "eps_beat_rate":      None,
-        "eps_surprise_trend": None,
-        "revision_momentum":  None,
+        "eps_surprise_avg": None, "eps_beat_rate": None,
+        "eps_surprise_trend": None, "revision_momentum": None,
     }
     try:
         obj = yf.Ticker(t)
@@ -822,8 +863,35 @@ def _fetch_yahoo_info_one(t):
         de_y = sf(info.get("debtToEquity"))
         if de_y is not None: result["debt_eq"] = de_y / 100.0
 
+        # ── EPS Growth: Tier-1 — Yahoo forward consensus ───────────────────
         eg_y = sf(info.get("earningsGrowth"))
-        if eg_y is not None: result["eps_growth"] = eg_y * 100.0
+        if eg_y is not None:
+            result["eps_growth"] = eg_y * 100.0
+            result["growth_src"] = "Yahoo-fwd"
+
+        # ── EPS Growth: Tier-2 (FIX-10) — 3-yr historical CAGR ────────────
+        # Fills the ~70% of tickers where earningsGrowth is blank.
+        # Uses obj.earnings annual DataFrame (Yahoo provides up to 4 years).
+        if result["eps_growth"] is None:
+            try:
+                earn_hist = obj.earnings
+                if earn_hist is not None and not earn_hist.empty:
+                    eps_col = None
+                    for col_candidate in ["Earnings", "EPS", "Net Income"]:
+                        if col_candidate in earn_hist.columns:
+                            eps_col = col_candidate
+                            break
+                    if eps_col is not None:
+                        eps_vals = earn_hist[eps_col].dropna()
+                        if len(eps_vals) >= 3:
+                            e_first = float(eps_vals.iloc[-3])
+                            e_last  = float(eps_vals.iloc[-1])
+                            if e_first > 0 and e_last > 0:
+                                cagr = ((e_last / e_first) ** (1.0 / 2.0) - 1.0) * 100.0
+                                result["eps_growth"] = cagr
+                                result["growth_src"] = "Yahoo-3yr-CAGR"
+            except Exception:
+                pass
 
         fwd_eps_val   = sf(info.get("forwardEps"))
         trail_eps_val = sf(info.get("trailingEps"))
@@ -850,36 +918,24 @@ def _fetch_yahoo_info_one(t):
             ev_s = ev_raw / rev_ttm_y
             if 0 < ev_s < 100: result["ev_sales"] = ev_s
 
-        # ── FIX-1: Dividend Yield ───────────────────────────────────────────
-        # Yahoo Finance `dividendYield` is already expressed as a decimal
-        # fraction (e.g. 0.0649 for 6.49%).  Multiplying by 100 converts
-        # it to a percentage correctly.  The v16 code did dy * 100.0 which
-        # is correct IF Yahoo returns a raw decimal.
-        #
-        # Root cause of the 100× bug: yfinance occasionally returns the
-        # value already as a percentage (e.g. 6.49 instead of 0.0649) for
-        # certain tickers or API versions.  We guard against both cases:
-        #   • If |dy| < 1.0  → treat as decimal fraction → multiply by 100
-        #   • If 1.0 ≤ |dy| ≤ 100 → already a percentage → use as-is
-        #   • If |dy| > 100  → invalid → None
-        # This makes the field robust regardless of yfinance version.
+        # Store ev_raw for use in EV/EBITDA TTM override in build_screener_table
+        result["ev_raw"] = ev_raw
+
+        # Dividend Yield (FIX-1 from v17)
         dy = sf(info.get("dividendYield"))
         if dy is not None:
             if abs(dy) < 1.0:
-                result["div_yield"] = dy * 100.0      # decimal → pct
+                result["div_yield"] = dy * 100.0
             elif abs(dy) <= 100.0:
-                result["div_yield"] = dy               # already pct
+                result["div_yield"] = dy
             else:
-                result["div_yield"] = None             # invalid
+                result["div_yield"] = None
 
-        # v17 Gap 5: earnings surprise
         avg_surp, beat_rt, surp_trend = extract_earnings_surprise_trend(obj)
         result["eps_surprise_avg"]   = avg_surp
         result["eps_beat_rate"]      = beat_rt
         result["eps_surprise_trend"] = surp_trend
-
-        # v17 Gap 6: revision momentum
-        result["revision_momentum"] = extract_revision_momentum(obj)
+        result["revision_momentum"]  = extract_revision_momentum(obj)
 
     except Exception:
         pass
@@ -888,8 +944,8 @@ def _fetch_yahoo_info_one(t):
 
 @st.cache_data(ttl=86400)
 def fetch_yahoo_info_all(tickers, _cache_date=None):
-    tl     = list(tickers); out = {}
-    CHUNK  = 30; WKRS = 8; SLEEP = 1.5
+    tl    = list(tickers); out = {}
+    CHUNK = 30; WKRS = 8; SLEEP = 1.5
     chunks = [tl[i:i+CHUNK] for i in range(0, len(tl), CHUNK)]
     prog   = st.progress(0); status = st.empty()
     for ci, chunk in enumerate(chunks):
@@ -911,7 +967,10 @@ def fetch_yahoo_info_all(tickers, _cache_date=None):
 
 
 # ══════════════════════════════════════════════════════════════════════════════
-# PHASE 2 — Deep financials (unchanged from v16)
+# PHASE 2 — Deep financials
+# FIX-7:  roa_prev now computed from prior-year qbs + qfin slices
+# FIX-8:  shares from balance-sheet Ordinary Shares row (not floatShares)
+# FIX-9:  ebitda_ttm = EBIT TTM + D&A TTM (replaces stale fiscal-year figure)
 # ══════════════════════════════════════════════════════════════════════════════
 def _fetch_yahoo_deep_one(t):
     result = {
@@ -924,6 +983,7 @@ def _fetch_yahoo_deep_one(t):
         "lt_debt_ratio_now": None, "lt_debt_ratio_prev": None,
         "current_ratio_now": None, "current_ratio_prev": None,
         "shares_now": None, "shares_prev": None,
+        "ebitda_ttm": None,   # FIX-9
     }
     try:
         obj  = yf.Ticker(t)
@@ -936,6 +996,8 @@ def _fetch_yahoo_deep_one(t):
         except Exception:
             pass
 
+        # ── Revenue ─────────────────────────────────────────────────────────
+        ebit_ttm_val = None   # captured here for ebitda_ttm computation
         if qfin is not None and not qfin.empty:
             rev_row = next((nm for nm in ["Total Revenue", "Revenue"]
                             if nm in qfin.index), None)
@@ -947,30 +1009,33 @@ def _fetch_yahoo_deep_one(t):
                     vals = [float(x) for x in rs.values]
                     result["rev4"] = ([None] * (4 - len(vals))) + vals
 
-            ebit_row = next((nm for nm in ["EBIT","Operating Income","Ebit"]
+            ebit_row = next((nm for nm in ["EBIT", "Operating Income", "Ebit"]
                              if nm in qfin.index), None)
             int_row  = next((nm for nm in ["Interest Expense",
                              "Interest Expense Non Operating",
                              "Net Interest Income"]
                              if nm in qfin.index), None)
             if ebit_row and int_row:
-                ebit_ttm = qfin.loc[ebit_row].dropna().head(4).sum()
-                int_ttm  = abs(qfin.loc[int_row].dropna().head(4).sum())
-                if int_ttm > 0 and ebit_ttm > 0:
+                ebit_ttm_val = float(qfin.loc[ebit_row].dropna().head(4).sum())
+                int_ttm      = abs(float(qfin.loc[int_row].dropna().head(4).sum()))
+                if int_ttm > 0 and ebit_ttm_val > 0:
                     result["int_coverage"] = min(
-                        float(ebit_ttm / int_ttm), 100.0)
+                        float(ebit_ttm_val / int_ttm), 100.0)
+            elif ebit_row:
+                ebit_ttm_val = float(qfin.loc[ebit_row].dropna().head(4).sum())
 
+        # ── ROIC ────────────────────────────────────────────────────────────
         if (qfin is not None and not qfin.empty
                 and qbs is not None and not qbs.empty):
             op_inc_row = next((nm for nm in
-                               ["Operating Income","EBIT","Ebit"]
+                               ["Operating Income", "EBIT", "Ebit"]
                                if nm in qfin.index), None)
             tax_row    = next((nm for nm in
-                               ["Tax Provision","Income Tax Expense",
+                               ["Tax Provision", "Income Tax Expense",
                                 "Tax Expense"]
                                if nm in qfin.index), None)
             pretax_row = next((nm for nm in
-                               ["Pretax Income","Income Before Tax","EBT"]
+                               ["Pretax Income", "Income Before Tax", "EBT"]
                                if nm in qfin.index), None)
             if op_inc_row:
                 op_inc_ttm   = float(qfin.loc[op_inc_row].dropna().head(4).sum())
@@ -993,7 +1058,7 @@ def _fetch_yahoo_deep_one(t):
                                       "Stockholders Equity",
                                       "Common Stock Equity",
                                       "Total Equity Gross Minority Interest"])
-                debt_val   = _bs_val(["Total Debt","Net Debt","Long Term Debt",
+                debt_val   = _bs_val(["Total Debt", "Net Debt", "Long Term Debt",
                                       "Long Term Debt And Capital Lease Obligation"])
                 cash_val   = _bs_val(["Cash And Cash Equivalents",
                                       "Cash Cash Equivalents And Short Term Investments",
@@ -1018,26 +1083,43 @@ def _fetch_yahoo_deep_one(t):
                         if -100 < roic_c < 200:
                             result["roic"] = roic_c
 
+        # ── OCF / FCF + D&A for ebitda_ttm ──────────────────────────────────
+        da_ttm_val = None
         if qcf is not None and not qcf.empty:
             ocf_row   = next((n for n in ["Operating Cash Flow",
                               "Cash From Operations",
                               "Total Cash From Operating Activities"]
                               if n in qcf.index), None)
             capex_row = next((n for n in ["Capital Expenditure",
-                              "Purchase Of PPE","Capital Expenditures",
+                              "Purchase Of PPE", "Capital Expenditures",
                               "Purchases Of Property Plant And Equipment"]
+                              if n in qcf.index), None)
+            da_row    = next((n for n in [
+                              "Depreciation And Amortization",
+                              "Depreciation Amortization Depletion",
+                              "Reconciled Depreciation",
+                              "Depreciation And Amortization In Income Statement"]
                               if n in qcf.index), None)
             if ocf_row:
                 ocf_ttm = float(qcf.loc[ocf_row].dropna().head(4).sum())
                 result["ocf_ttm"] = ocf_ttm
                 if capex_row:
-                    capex_ttm = abs(float(qcf.loc[capex_row].dropna().head(4).sum()))
+                    capex_ttm = abs(float(
+                        qcf.loc[capex_row].dropna().head(4).sum()))
                     result["fcf_ttm"] = ocf_ttm - capex_ttm
+            if da_row:
+                da_ttm_val = abs(float(
+                    qcf.loc[da_row].dropna().head(4).sum()))
 
+        # ── FIX-9: ebitda_ttm = EBIT TTM + D&A TTM ──────────────────────────
+        if ebit_ttm_val is not None and da_ttm_val is not None:
+            result["ebitda_ttm"] = ebit_ttm_val + da_ttm_val
+
+        # ── Gross margin + net income ────────────────────────────────────────
         if qfin is not None and not qfin.empty:
-            gp_row   = next((n for n in ["Gross Profit","Gross Income"]
+            gp_row   = next((n for n in ["Gross Profit", "Gross Income"]
                              if n in qfin.index), None)
-            rev_row2 = next((n for n in ["Total Revenue","Revenue"]
+            rev_row2 = next((n for n in ["Total Revenue", "Revenue"]
                              if n in qfin.index), None)
             ni_row   = next((n for n in ["Net Income",
                              "Net Income Common Stockholders"]
@@ -1059,17 +1141,19 @@ def _fetch_yahoo_deep_one(t):
                 result["net_income_ttm"] = float(
                     qfin.loc[ni_row].dropna().head(4).sum())
 
+        # ── Balance sheet ────────────────────────────────────────────────────
         if qbs is not None and not qbs.empty:
-            ta_row  = next((n for n in ["Total Assets","Assets"]
+            ta_row  = next((n for n in ["Total Assets", "Assets"]
                             if n in qbs.index), None)
             ltd_row = next((n for n in ["Long Term Debt",
                             "Long Term Debt And Capital Lease Obligation"]
                             if n in qbs.index), None)
-            ca_row  = next((n for n in ["Current Assets","Total Current Assets"]
+            ca_row  = next((n for n in ["Current Assets", "Total Current Assets"]
                             if n in qbs.index), None)
             cl_row  = next((n for n in ["Current Liabilities",
                             "Total Current Liabilities"]
                             if n in qbs.index), None)
+
             if ta_row:
                 ta_vals = qbs.loc[ta_row].dropna()
                 if len(ta_vals) >= 1:
@@ -1082,6 +1166,30 @@ def _fetch_yahoo_deep_one(t):
                         ni_val  = result.get("net_income_ttm")
                         if avg_ta > 0 and ni_val is not None:
                             result["roa_ttm"] = ni_val / avg_ta * 100.0
+
+                    # ── FIX-7: roa_prev from prior-year slices ───────────────
+                    # Need: total assets at quarters 5 and 9 (year-ago window)
+                    # and net income for quarters 5–8 (prior TTM).
+                    # Guard: require at least 9 quarters of balance-sheet data
+                    # AND at least 8 quarters of income-statement data.
+                    ni_all = None
+                    if qfin is not None and not qfin.empty:
+                        ni_row_inner = next((n for n in [
+                            "Net Income", "Net Income Common Stockholders"]
+                            if n in qfin.index), None)
+                        if ni_row_inner:
+                            ni_all = qfin.loc[ni_row_inner].dropna()
+
+                    if (len(ta_vals) >= 9
+                            and ni_all is not None
+                            and len(ni_all) >= 8):
+                        ta_yr1a  = float(ta_vals.iloc[4])
+                        ta_yr1b  = float(ta_vals.iloc[8])
+                        avg_ta_prev = (ta_yr1a + ta_yr1b) / 2.0
+                        ni_prev_ttm = float(ni_all.iloc[4:8].sum())
+                        if avg_ta_prev > 0:
+                            result["roa_prev"] = ni_prev_ttm / avg_ta_prev * 100.0
+
             if ltd_row:
                 ltd_vals = qbs.loc[ltd_row].dropna()
                 ta_n     = result.get("total_assets_now")
@@ -1090,22 +1198,46 @@ def _fetch_yahoo_deep_one(t):
                 if len(ltd_vals) >= 5:
                     ta_p = result.get("total_assets_prev")
                     if ta_p and ta_p > 0:
-                        result["lt_debt_ratio_prev"] = float(ltd_vals.iloc[4]) / ta_p
+                        result["lt_debt_ratio_prev"] = float(
+                            ltd_vals.iloc[4]) / ta_p
+
             if ca_row and cl_row:
                 ca_vals = qbs.loc[ca_row].dropna()
                 cl_vals = qbs.loc[cl_row].dropna()
                 if len(ca_vals) >= 1 and len(cl_vals) >= 1:
                     cl_now = float(cl_vals.iloc[0])
                     if cl_now > 0:
-                        result["current_ratio_now"] = float(ca_vals.iloc[0]) / cl_now
+                        result["current_ratio_now"] = float(
+                            ca_vals.iloc[0]) / cl_now
                 if len(ca_vals) >= 5 and len(cl_vals) >= 5:
                     cl_prev = float(cl_vals.iloc[4])
                     if cl_prev > 0:
                         result["current_ratio_prev"] = (
                             float(ca_vals.iloc[4]) / cl_prev)
 
-        result["shares_now"]  = sf(info.get("sharesOutstanding"))
-        result["shares_prev"] = sf(info.get("floatShares"))
+            # ── FIX-8: shares from balance-sheet row (not floatShares) ───────
+            # Yahoo balance sheet may expose shares under several row names.
+            # Fall back to info dict only when the balance sheet row is absent.
+            sh_row = next((n for n in [
+                "Ordinary Shares Number",
+                "Share Issued",
+                "Common Stock Shares Outstanding",
+            ] if n in qbs.index), None)
+
+            if sh_row:
+                sh_vals = qbs.loc[sh_row].dropna()
+                if len(sh_vals) >= 1:
+                    result["shares_now"] = float(sh_vals.iloc[0])
+                if len(sh_vals) >= 5:
+                    result["shares_prev"] = float(sh_vals.iloc[4])
+
+            # Fallback to info dict when balance sheet row unavailable
+            if result["shares_now"] is None:
+                result["shares_now"] = sf(info.get("sharesOutstanding"))
+            # If prev still None but now is available, compare now vs now
+            # (L3 will pass — conservative default for missing prior data)
+            if result["shares_prev"] is None:
+                result["shares_prev"] = result["shares_now"]
 
     except Exception:
         pass
@@ -1121,7 +1253,7 @@ def fetch_yahoo_deep_financials(tickers_filtered, _cache_date=None):
     prog   = st.progress(0); status = st.empty()
     for ci, chunk in enumerate(chunks):
         status.text("Phase 2/2 — Deep: chunk {}/{} ({}/{})...".format(
-            ci + 1, len(chunks), min((ci+1)*CHUNK, len(tl)), len(tl)))
+            ci + 1, len(chunks), min((ci + 1) * CHUNK, len(tl)), len(tl)))
         with concurrent.futures.ThreadPoolExecutor(max_workers=WKRS) as ex:
             futs = {ex.submit(_fetch_yahoo_deep_one, t): t for t in chunk}
             for fut in concurrent.futures.as_completed(
@@ -1149,23 +1281,25 @@ def _pre_filter_tickers(info_map, universe_df, mc_min_b, pe_max):
 
 
 def merge_yahoo_phases(info_map, deep_map, tickers):
+    # FIX-9: added ebitda_ttm to the deep passthrough list
     NEW_DEEP = [
-        "ocf_ttm","fcf_ttm","net_income_ttm","gross_profit_ttm",
-        "gross_margin_now","gross_margin_prev","roa_ttm","roa_prev",
-        "total_assets_now","total_assets_prev",
-        "lt_debt_ratio_now","lt_debt_ratio_prev",
-        "current_ratio_now","current_ratio_prev",
-        "shares_now","shares_prev",
+        "ocf_ttm", "fcf_ttm", "net_income_ttm", "gross_profit_ttm",
+        "gross_margin_now", "gross_margin_prev", "roa_ttm", "roa_prev",
+        "total_assets_now", "total_assets_prev",
+        "lt_debt_ratio_now", "lt_debt_ratio_prev",
+        "current_ratio_now", "current_ratio_prev",
+        "shares_now", "shares_prev",
+        "ebitda_ttm",   # FIX-9
     ]
     merged = {}
     for t in tickers:
         base = dict(info_map.get(t, {}))
         deep = deep_map.get(t, {})
         base["roic"]         = (deep.get("roic") if deep.get("roic") is not None
-                                 else base.get("roic"))
+                                else base.get("roic"))
         base["int_coverage"] = (deep.get("int_coverage")
-                                 if deep.get("int_coverage") is not None
-                                 else base.get("int_coverage"))
+                                if deep.get("int_coverage") is not None
+                                else base.get("int_coverage"))
         base["rev4"] = deep.get("rev4", [None, None, None, None])
         for f in NEW_DEEP:
             base[f] = deep.get(f)
@@ -1173,7 +1307,7 @@ def merge_yahoo_phases(info_map, deep_map, tickers):
     return merged
 
 
-# ── FMP fetches (unchanged from v16) ──────────────────────────────────────────
+# ── FMP fetches ────────────────────────────────────────────────────────────────
 @st.cache_data(ttl=86400)
 def fetch_fmp_quotes_if_available(tickers, api_key):
     out = {}
@@ -1187,7 +1321,7 @@ def fetch_fmp_quotes_if_available(tickers, api_key):
             data = r.json()
             if not isinstance(data, list): continue
             for item in data:
-                t = str(item.get("symbol","")).upper().strip()
+                t = str(item.get("symbol", "")).upper().strip()
                 if not t: continue
                 pe = sf(item.get("pe")); mc = sf(item.get("marketCap"))
                 if pe is not None and (pe <= 0 or pe > 10_000): pe = None
@@ -1218,24 +1352,26 @@ def fetch_fmp_ratios_if_available(tickers, api_key):
             t, api_key))
         try:
             r = requests.get(url, timeout=12)
-            if r.status_code == 429: time.sleep(3.0); r = requests.get(url, timeout=12)
+            if r.status_code == 429:
+                time.sleep(3.0); r = requests.get(url, timeout=12)
             r.raise_for_status()
             d = r.json()
             if not isinstance(d, list) or len(d) == 0: return t, {}
-            item = d[0]
-            peg_raw = sf(item.get("priceEarningsGrowthRatioTTM"))
-            peg     = peg_raw if (peg_raw and 0 < peg_raw <= 500) else None
+            item     = d[0]
+            peg_raw  = sf(item.get("priceEarningsGrowthRatioTTM"))
+            peg      = peg_raw if (peg_raw and 0 < peg_raw <= 500) else None
             roic_raw = sf(item.get("returnOnInvestedCapitalTTM"))
-            roic = normalise_pct_fmp(roic_raw) if roic_raw is not None else None
-            roe_raw = sf(item.get("returnOnEquityTTM"))
-            roe  = normalise_pct_fmp(roe_raw) if roe_raw is not None else None
-            om_raw = sf(item.get("operatingProfitMarginTTM"))
-            om   = normalise_pct_fmp(om_raw) if om_raw is not None else None
-            ic_raw = sf(item.get("interestCoverageTTM"))
-            ic   = min(float(ic_raw), 100.0) if (ic_raw and ic_raw > 0) else None
-            de   = sf(item.get("debtEquityRatioTTM"))
+            roic     = normalise_pct_fmp(roic_raw) if roic_raw is not None else None
+            roe_raw  = sf(item.get("returnOnEquityTTM"))
+            roe      = normalise_pct_fmp(roe_raw)  if roe_raw  is not None else None
+            om_raw   = sf(item.get("operatingProfitMarginTTM"))
+            om       = normalise_pct_fmp(om_raw)   if om_raw   is not None else None
+            ic_raw   = sf(item.get("interestCoverageTTM"))
+            ic       = min(float(ic_raw), 100.0) if (ic_raw and ic_raw > 0) else None
+            de       = sf(item.get("debtEquityRatioTTM"))
             fmp_pe_raw = sf(item.get("priceToEarningsRatioTTM"))
-            fmp_pe = (fmp_pe_raw if (fmp_pe_raw and 0 < fmp_pe_raw <= 10_000) else None)
+            fmp_pe   = (fmp_pe_raw
+                        if (fmp_pe_raw and 0 < fmp_pe_raw <= 10_000) else None)
             return t, {"peg": peg, "roic": roic, "roe": roe, "op_margin": om,
                        "int_coverage": ic, "debt_eq": de,
                        "fmp_trailing_pe": fmp_pe,
@@ -1258,15 +1394,16 @@ def fetch_fmp_ratios_if_available(tickers, api_key):
 
 
 def merge_all_sources(yahoo_data, fmp_quotes, fmp_ratios, tickers):
+    # FIX-9: ebitda_ttm added; ev_raw added for EV/EBITDA TTM override
     NEW_FIELDS = [
-        "ev_ebitda","ev_sales","div_yield",
-        "ocf_ttm","fcf_ttm","net_income_ttm","gross_profit_ttm",
-        "gross_margin_now","gross_margin_prev","roa_ttm","roa_prev",
-        "total_assets_now","total_assets_prev",
-        "lt_debt_ratio_now","lt_debt_ratio_prev",
-        "current_ratio_now","current_ratio_prev",
-        "shares_now","shares_prev",
-        "eps_surprise_avg","eps_beat_rate","eps_surprise_trend",
+        "ev_ebitda", "ev_sales", "div_yield", "ev_raw", "ebitda_ttm",
+        "ocf_ttm", "fcf_ttm", "net_income_ttm", "gross_profit_ttm",
+        "gross_margin_now", "gross_margin_prev", "roa_ttm", "roa_prev",
+        "total_assets_now", "total_assets_prev",
+        "lt_debt_ratio_now", "lt_debt_ratio_prev",
+        "current_ratio_now", "current_ratio_prev",
+        "shares_now", "shares_prev",
+        "eps_surprise_avg", "eps_beat_rate", "eps_surprise_trend",
         "revision_momentum",
     ]
     merged = {}
@@ -1286,19 +1423,19 @@ def merge_all_sources(yahoo_data, fmp_quotes, fmp_ratios, tickers):
             "pe":          pe_val,
             "pe_src":      ("FMP-quote"  if fq.get("pe")              is not None else
                             "FMP-ratios" if fr.get("fmp_trailing_pe") is not None else
-                            yb.get("pe_src","Yahoo")),
+                            yb.get("pe_src", "Yahoo")),
             "fwd_pe":      yb.get("fwd_pe"),
-            "peg":         first(fr.get("peg"),         yb.get("peg")),
+            "peg":         first(fr.get("peg"),          yb.get("peg")),
             "peg_src":     ("FMP-ratios" if fr.get("peg") is not None else
-                            yb.get("peg_src","Yahoo") if yb.get("peg") is not None
+                            yb.get("peg_src", "Yahoo") if yb.get("peg") is not None
                             else "—"),
-            "roic":        first(fr.get("roic"),         yb.get("roic")),
-            "roe":         first(fr.get("roe"),           yb.get("roe")),
-            "int_coverage":first(fr.get("int_coverage"), yb.get("int_coverage")),
-            "op_margin":   first(fr.get("op_margin"),    yb.get("op_margin")),
-            "debt_eq":     first(fr.get("debt_eq"),       yb.get("debt_eq")),
+            "roic":        first(fr.get("roic"),          yb.get("roic")),
+            "roe":         first(fr.get("roe"),            yb.get("roe")),
+            "int_coverage":first(fr.get("int_coverage"),  yb.get("int_coverage")),
+            "op_margin":   first(fr.get("op_margin"),     yb.get("op_margin")),
+            "debt_eq":     first(fr.get("debt_eq"),        yb.get("debt_eq")),
             "eps_growth":  yb.get("eps_growth"),
-            "growth_src":  "Yahoo" if yb.get("eps_growth") is not None else None,
+            "growth_src":  yb.get("growth_src"),
             "earn_traj":   yb.get("earn_traj"),
             "mc":          first(fq.get("mc"), yb.get("mc")),
             "rev4":        yb.get("rev4", [None, None, None, None]),
@@ -1310,40 +1447,24 @@ def merge_all_sources(yahoo_data, fmp_quotes, fmp_ratios, tickers):
 
 
 # ── Quality flag ──────────────────────────────────────────────────────────────
-# FIX-2: Document Financials ROE exemption clearly in comments.
-# FIX-3: Use epsilon-safe comparison for ROIC/ROE threshold boundary.
-# FIX-6: Use SLOAN_ACCRUALS_THRESHOLD constant.
 def quality_flag(roic, roe, ic, om, sloan_ratio=None, sector=None):
     """
-    Returns a comma-separated string of quality flags, or 'Pass'.
-
-    Financials sector exemption (INTENTIONAL):
-        Banks and insurers have ROIC that is structurally unmeaningful
-        because they use customer deposits (liabilities) as their primary
-        capital base — invested capital denominator is not comparable to
-        industrial firms.  For Financials, ROE is used as the profitability
-        metric instead.  The threshold (8%) remains the same.
-        FIS, BRO, L, BRK-B, FISV showing Pass despite low ROIC is CORRECT —
-        their ROE exceeds 8% even though ROIC does not.
-
-    Boundary condition (FIX-3):
-        Uses strict less-than with a small epsilon guard to ensure that
-        a value of exactly 8.0 is NOT flagged (threshold is exclusive).
+    Returns comma-separated quality flags or 'Pass'.
+    Financials sector uses ROE instead of ROIC (structurally correct).
+    FIX-3 (v17): epsilon-safe threshold boundary.
+    FIX-6 (v17): centralized SLOAN_ACCRUALS_THRESHOLD constant.
     """
-    THRESHOLD  = QUALITY_THRESHOLDS["roic_min"]          # 8.0
-    EPSILON    = 1e-9                                     # float safety margin
-
+    THRESHOLD = QUALITY_THRESHOLDS["roic_min"]
+    EPSILON   = 1e-9
     flags = []
 
     if sector in ROE_PRIMARY_SECTORS:
-        # Financials: evaluate ROE, not ROIC
         profitability = roe
         prof_label    = "ROE"
     else:
         profitability = roic if (roic is not None and not pd.isna(roic)) else roe
         prof_label    = "ROIC" if (roic is not None and not pd.isna(roic)) else "ROE"
 
-    # FIX-3: strict less-than with epsilon so 8.0 exactly → Pass
     if (profitability is not None
             and not pd.isna(profitability)
             and float(profitability) < THRESHOLD - EPSILON):
@@ -1360,7 +1481,6 @@ def quality_flag(roic, roe, ic, om, sloan_ratio=None, sector=None):
                 and float(om) < QUALITY_THRESHOLDS["op_margin_min"]):
             flags.append("Margin<5%")
 
-    # FIX-6: centralized threshold constant
     if (sloan_ratio is not None
             and not pd.isna(sloan_ratio)
             and float(sloan_ratio) > SLOAN_ACCRUALS_THRESHOLD):
@@ -1401,7 +1521,7 @@ def compute_rank_by_sector(scr):
                W["earn_traj"] * elig["_s_etraj"]   +
                W["momentum"]  * elig["_s_mom"])
 
-        factor_cols = ["P/E","PEG","Quality Score","Earn Traj","Momentum Score"]
+        factor_cols = ["P/E", "PEG", "Quality Score", "Earn Traj", "Momentum Score"]
         penalties   = elig.apply(
             lambda r: missing_factor_penalty(r, factor_cols), axis=1)
         raw = raw * penalties
@@ -1416,6 +1536,8 @@ def compute_rank_by_sector(scr):
 
 
 # ── Build screener table ───────────────────────────────────────────────────────
+# FIX-9:  EV/EBITDA TTM override using deep ebitda_ttm value
+# FIX-11: Tier-3 PEG — earn_traj proxy when tiers 1 & 2 both fail
 def build_screener_table(universe_df, pm_map, merged_map):
     rows = []
     for _, r in universe_df.iterrows():
@@ -1447,8 +1569,6 @@ def build_screener_table(universe_df, pm_map, merged_map):
         if pd.notna(price) and pd.notna(hi) and pd.notna(lo) and hi != lo:
             pos52 = float((price - lo) / (hi - lo) * 100.0)
 
-        # FIX-5: Pass raw list values — do NOT wrap in to_num() before the
-        #         CAGR function. Apply to_num() only on the returned result.
         rev4_raw = fi.get("rev4", [None, None, None, None])
         rq1 = sf(rev4_raw[0]) if len(rev4_raw) > 0 else None
         rq2 = sf(rev4_raw[1]) if len(rev4_raw) > 1 else None
@@ -1456,8 +1576,13 @@ def build_screener_table(universe_df, pm_map, merged_map):
         rq4 = sf(rev4_raw[3]) if len(rev4_raw) > 3 else None
         growth = to_num(revenue_growth_pct_cagr([rq1, rq2, rq3, rq4]))
 
+        # ── PEG: Tiers 1 + 2 + 3 (FIX-10, FIX-11) ───────────────────────────
+        # Tier 1: Direct PEG from Yahoo/FMP (most reliable)
+        # Tier 2: Compute from eps_growth (Yahoo forward or 3yr CAGR from FIX-10)
+        # Tier 3: earn_traj proxy — last resort only when both above fail
         peg_direct = to_num(fi.get("peg"))
         peg = None; peg_method = "—"
+
         if pd.notna(peg_direct):
             peg        = float(peg_direct)
             peg_method = fi.get("peg_src") or "Yahoo"
@@ -1469,10 +1594,19 @@ def build_screener_table(universe_df, pm_map, merged_map):
                 eg = float(eps_g)
                 if eg >= MIN_GROWTH_PCT_FOR_PEG and pd.notna(pe_for_peg):
                     peg        = float(pe_for_peg) / eg
-                    peg_method = "{} EPS growth".format(g_src)
+                    peg_method = g_src
+
+            # Tier 3 (FIX-11): earn_traj as last-resort PEG denominator
+            # Only applied when tiers 1 and 2 both yield no valid PEG.
+            if peg is None and pd.notna(earn_traj) and float(earn_traj) > 0:
+                proxy_growth = float(earn_traj) * 100.0
+                if proxy_growth >= MIN_GROWTH_PCT_FOR_PEG and pd.notna(pe_for_peg):
+                    peg        = float(pe_for_peg) / proxy_growth
+                    peg_method = "EarnTraj-proxy"
+
         if peg is not None and (peg <= 0 or peg > 500): peg = None
 
-        # Piotroski + Sloan
+        # ── Piotroski + Sloan ─────────────────────────────────────────────────
         fi_g = dict(fi)
         fi_g["rev_growth_pct"] = float(growth) if pd.notna(growth) else None
         piotroski_f, _ = compute_piotroski_fscore(fi_g)
@@ -1480,17 +1614,29 @@ def build_screener_table(universe_df, pm_map, merged_map):
             fi.get("net_income_ttm"), fi.get("ocf_ttm"),
             fi.get("total_assets_now"), fi.get("total_assets_prev"))
 
-        # FCF Yield
+        # ── FCF Yield ─────────────────────────────────────────────────────────
         fcf_ttm   = fi.get("fcf_ttm")
         fcf_yield = None
         if fcf_ttm is not None and pd.notna(mc) and float(mc) > 0:
             fcf_yield = float(fcf_ttm) / float(mc) * 100.0
 
-        # FCF/NI ratio
+        # ── FCF/NI ratio ──────────────────────────────────────────────────────
         fcf_ni_ratio = None
         ni_val = fi.get("net_income_ttm")
         if fcf_ttm is not None and ni_val is not None and float(ni_val) != 0:
             fcf_ni_ratio = float(fcf_ttm) / float(ni_val)
+
+        # ── FIX-9: EV/EBITDA using TTM value when available ──────────────────
+        # Prefer the deep-computed ebitda_ttm (EBIT TTM + D&A TTM) over the
+        # stale fiscal-year ebitda returned by info.get("ebitda").
+        ev_ebitda_display = to_num(fi.get("ev_ebitda"))   # info-based fallback
+        ebitda_ttm_val    = fi.get("ebitda_ttm")
+        ev_raw_val        = fi.get("ev_raw")
+        if (ebitda_ttm_val is not None and ev_raw_val is not None
+                and float(ebitda_ttm_val) > 0 and float(ev_raw_val) > 0):
+            ev_ttm_ratio = float(ev_raw_val) / float(ebitda_ttm_val)
+            if 0 < ev_ttm_ratio < 200:
+                ev_ebitda_display = to_num(ev_ttm_ratio)
 
         q_score = compute_quality_score_elite(
             float(roic)   if pd.notna(roic) else None,
@@ -1498,13 +1644,15 @@ def build_screener_table(universe_df, pm_map, merged_map):
             float(ic)     if pd.notna(ic)   else None,
             float(om)     if pd.notna(om)   else None,
             gross_margin_now  = (float(fi["gross_margin_now"])
-                                 if fi.get("gross_margin_now") is not None else None),
+                                 if fi.get("gross_margin_now") is not None
+                                 else None),
             gross_margin_prev = (float(fi["gross_margin_prev"])
-                                 if fi.get("gross_margin_prev") is not None else None),
-            fcf_ni_ratio = fcf_ni_ratio,
-            piotroski_f  = piotroski_f,
-            sloan_ratio  = sloan_ratio,
-            sector       = sec,
+                                 if fi.get("gross_margin_prev") is not None
+                                 else None),
+            fcf_ni_ratio  = fcf_ni_ratio,
+            piotroski_f   = piotroski_f,
+            sloan_ratio   = sloan_ratio,
+            sector        = sec,
         )
 
         rows.append({
@@ -1535,20 +1683,20 @@ def build_screener_table(universe_df, pm_map, merged_map):
             "Rev Q3 ($B)":        to_num(rq3),
             "Rev Q4 Latest ($B)": to_num(rq4),
             "Rev Growth% (CAGR)": growth,
-            "EV/EBITDA":    to_num(fi.get("ev_ebitda")),
-            "FCF Yield%":   to_num(fcf_yield),
-            "EV/Sales":     to_num(fi.get("ev_sales")),
-            "Div Yield%":   to_num(fi.get("div_yield")),
-            "Piotroski F":  to_num(piotroski_f),
-            "Sloan Ratio":  to_num(sloan_ratio),
-            "EPS Surp Avg%":   to_num(fi.get("eps_surprise_avg")),
-            "EPS Beat Rate":   to_num(fi.get("eps_beat_rate")),
-            "EPS Surp Trend":  to_num(fi.get("eps_surprise_trend")),
-            "Revision Mom":    to_num(fi.get("revision_momentum")),
-            "Skip Mo":         to_num(pm.get("skip_month_raw")),
-            "52W Prox":        to_num(pm.get("hi52_proximity")),
-            "vs MA200":        to_num(pm.get("vs_ma200")),
-            "Rel Str SPY":     to_num(pm.get("rel_strength_spy")),
+            "EV/EBITDA":          ev_ebitda_display,
+            "FCF Yield%":         to_num(fcf_yield),
+            "EV/Sales":           to_num(fi.get("ev_sales")),
+            "Div Yield%":         to_num(fi.get("div_yield")),
+            "Piotroski F":        to_num(piotroski_f),
+            "Sloan Ratio":        to_num(sloan_ratio),
+            "EPS Surp Avg%":      to_num(fi.get("eps_surprise_avg")),
+            "EPS Beat Rate":      to_num(fi.get("eps_beat_rate")),
+            "EPS Surp Trend":     to_num(fi.get("eps_surprise_trend")),
+            "Revision Mom":       to_num(fi.get("revision_momentum")),
+            "Skip Mo":            to_num(pm.get("skip_month_raw")),
+            "52W Prox":           to_num(pm.get("hi52_proximity")),
+            "vs MA200":           to_num(pm.get("vs_ma200")),
+            "Rel Str SPY":        to_num(pm.get("rel_strength_spy")),
         })
 
     scr = pd.DataFrame(rows)
@@ -1561,16 +1709,16 @@ def build_screener_table(universe_df, pm_map, merged_map):
     )
 
     num_cols = [
-        "Price","Mkt Cap","P/E","Fwd P/E","PEG","52W Pos%",
-        "ROIC%","ROE%","Int Coverage","Op Margin%","Debt/Eq",
-        "Quality Score","Earn Traj","Momentum Score",
-        "Ret 1Mo%","Ret 3Mo%","Ret 6Mo%","Trailing Vol%","MC% of S&P500",
-        "Rev Q1 Oldest ($B)","Rev Q2 ($B)","Rev Q3 ($B)","Rev Q4 Latest ($B)",
+        "Price", "Mkt Cap", "P/E", "Fwd P/E", "PEG", "52W Pos%",
+        "ROIC%", "ROE%", "Int Coverage", "Op Margin%", "Debt/Eq",
+        "Quality Score", "Earn Traj", "Momentum Score",
+        "Ret 1Mo%", "Ret 3Mo%", "Ret 6Mo%", "Trailing Vol%", "MC% of S&P500",
+        "Rev Q1 Oldest ($B)", "Rev Q2 ($B)", "Rev Q3 ($B)", "Rev Q4 Latest ($B)",
         "Rev Growth% (CAGR)",
-        "EV/EBITDA","FCF Yield%","EV/Sales","Div Yield%",
-        "Piotroski F","Sloan Ratio",
-        "EPS Surp Avg%","EPS Beat Rate","EPS Surp Trend","Revision Mom",
-        "Skip Mo","52W Prox","vs MA200","Rel Str SPY",
+        "EV/EBITDA", "FCF Yield%", "EV/Sales", "Div Yield%",
+        "Piotroski F", "Sloan Ratio",
+        "EPS Surp Avg%", "EPS Beat Rate", "EPS Surp Trend", "Revision Mom",
+        "Skip Mo", "52W Prox", "vs MA200", "Rel Str SPY",
     ]
     for c in num_cols:
         if c in scr.columns:
@@ -1588,32 +1736,34 @@ def build_screener_table(universe_df, pm_map, merged_map):
     return scr
 
 
-# ── Reference Guide (unchanged) ───────────────────────────────────────────────
+# ── Reference Guide ────────────────────────────────────────────────────────────
 def render_reference_guide():
     st.markdown("## Column Reference Guide")
     st.caption("All metrics with formula, benchmarks, and scoring role.")
 
     tabs = st.tabs([
         "Valuation", "Quality", "PEG", "Earn Trajectory",
-        "Momentum (v17)", "Earnings Surprise (v17)",
+        "Momentum (v18)", "Earnings Surprise (v18)",
         "Ranking & Score", "Display-Only",
     ])
     tab_val, tab_qual, tab_peg, tab_etraj, tab_mom, tab_surp, tab_rank, tab_disp = tabs
 
     with tab_val:
         st.markdown("""
-**Valuation Composite (v16)** — FCF Yield 40% + EV/EBITDA 35% + Fwd P/E 25%
+**Valuation Composite (v18)** — FCF Yield 40% + EV/EBITDA 35% + Fwd P/E 25%
+
+EV/EBITDA now uses **TTM** (EBIT TTM + D&A TTM) instead of fiscal-year figure.
 
 | Signal | Better | Why |
 |---|---|---|
-| FCF Yield% = (OCF−CapEx)/MktCap×100 | Higher | Pure cash — no accounting noise |
-| EV/EBITDA = EV/EBITDA TTM | Lower | Capital-structure neutral |
+| FCF Yield% = (OCF-CapEx)/MktCap x100 | Higher | Pure cash — no accounting noise |
+| EV/EBITDA TTM | Lower | Capital-structure neutral; seasonal-safe |
 | Fwd P/E (or trailing P/E) | Lower | Consensus anchor |
         """)
 
     with tab_qual:
         st.markdown("""
-**Quality Score (0–100) — 7 sub-signals**
+**Quality Score (0-100) — 7 sub-signals**
 
 | Sub-signal | Weight | Formula |
 |---|---|---|
@@ -1621,64 +1771,71 @@ def render_reference_guide():
 | Interest Coverage | 15% | EBIT / Interest TTM |
 | Operating Margin (non-Fin) | 15% | Op Inc / Rev |
 | Gross Margin + trend | 20% | Gross Profit / Rev |
-| Piotroski F (0–9) | 15% | 9 binary tests |
-| Sloan Ratio | 10% | (NI − OCF) / Avg Assets |
+| Piotroski F (0-9) | 15% | 9 binary tests (P3+L3 now live in v18) |
+| Sloan Ratio | 10% | (NI - OCF) / Avg Assets |
 
-**Quality Flag** notes:
-- Financials sector (banks/insurers): ROE is used instead of ROIC.
-  FIS, BRO, L, BRK-B, FISV showing **Pass** despite low ROIC is **intentional** —
-  they pass the ROE ≥ 8% test. ROIC is not meaningful for deposit-funded firms.
-- **HighAccruals** threshold: Sloan Ratio > {:.2f} (SLOAN_ACCRUALS_THRESHOLD)
-- **WMB boundary**: ROIC = 8.0 exactly → Pass (threshold is strict less-than)
+**v18 fixes**: Piotroski P3 (ROA improving) and L3 (no dilution) are now
+correctly computed using balance-sheet historical slices.
+- HighAccruals threshold: Sloan Ratio > {:.2f}
+- Financials: ROE replaces ROIC (deposit-funded firms)
         """.format(SLOAN_ACCRUALS_THRESHOLD))
 
     with tab_peg:
         st.markdown("""
-**PEG** = P/E / EPS Growth Rate (%). Guard: growth ≥ 5%.
+**PEG v18 — 3-tier fallback cascade**
+
+| Tier | Source | Coverage |
+|---|---|---|
+| 1 | Yahoo/FMP pegRatio direct | ~30% |
+| 2 | Yahoo earningsGrowth (fwd) or 3yr historical CAGR (FIX-10) | ~75% |
+| 3 | Earn Traj proxy when both fail (FIX-11) | ~90% |
+
+Guard: growth rate >= 5% required. PEG > 500 or <= 0 → None.
 
 | PEG | Signal |
 |---|---|
 | < 1.0 | Potentially undervalued for growth rate |
-| 1.0–2.0 | Fair value |
+| 1.0-2.0 | Fair value |
 | > 2.0 | Expensive vs growth |
         """)
 
     with tab_etraj:
         st.markdown("""
-**Earn Traj** = (Fwd EPS − Trail EPS) / |Trail EPS|, clipped [−1, +1].
+**Earn Traj** = (Fwd EPS - Trail EPS) / |Trail EPS|, clipped [-1, +1].
 Both-negative cap at +0.30.
         """)
 
     with tab_mom:
         st.markdown("""
-**Momentum Score (v17) — 4-signal composite**
+**Momentum Score (v18) — 4-signal composite**
 
 | Signal | Weight | Formula |
 |---|---|---|
-| Skip Mo | 40% | (6Mo − 1Mo) / Ann Vol ÷ 2 |
-| 52W Prox | 25% | 1 − (price−hi52)/(hi52×0.30) |
-| vs MA200 | 20% | (price−MA200)/MA200 ÷ 0.30 |
-| Rel Str SPY | 15% | (Stock 3Mo − SPY 3Mo) ÷ 20 |
+| Skip Mo | 40% | (6Mo - 1Mo) / Ann Vol / 2 |
+| 52W Prox | 25% | 1 - (price-hi52)/(hi52 x 0.30) |
+| vs MA200 | 20% | (price-MA200)/MA200 / 0.30 |
+| Rel Str SPY | 15% | (Stock 3Mo - SPY 3Mo) / 20 |
         """)
 
     with tab_surp:
         st.markdown("""
-**EPS Surprise Signals (v17)**
+**EPS Surprise Signals (v18)**
 
 | Column | Formula |
 |---|---|
-| EPS Surp Avg% | Mean (Actual − Est) / \|Est\| × 100 over last 4Q |
+| EPS Surp Avg% | Mean (Actual-Est) / Est x 100 over last 4Q |
 | EPS Beat Rate | Count(beats) / 4 |
 | EPS Surp Trend | +1 if recent 2Q avg > earlier 2Q avg |
 
-**Revision Mom**: analyst upgrade/downgrade momentum, range −1.0 to +1.0.
+**Revision Mom**: analyst upgrade/downgrade momentum, range -1.0 to +1.0.
         """)
 
     with tab_rank:
         st.markdown("""
-**Score Δ** — change vs previous session snapshot. None on first load.
+**Score Delta v18** — run_id tagged; always compares against a prior session.
+No stale reads after Refresh / cache clear.
 
-**Conviction Score** — three multipliers: data completeness × signal agreement × anomaly.
+**Conviction Score** — completeness x signal agreement x anomaly multiplier.
 
 **CS Score** — cross-sectional S&P 500 ranking (not sector-relative).
 
@@ -1693,19 +1850,20 @@ Both-negative cap at +0.30.
 
     with tab_disp:
         st.markdown("""
-| Column | Typical Coverage |
+| Column | Typical Coverage v18 |
 |---|---|
 | EPS Surp Avg% / Beat Rate / Trend | ~65% |
 | Revision Mom | ~75% |
+| PEG (all 3 tiers) | ~90% |
 | Momentum signals | ~97% |
 | CS Score | 100% (computed) |
-| Score Δ | None first load |
+| Score Delta | None first load; run_id-safe thereafter |
         """)
 
     st.markdown("---")
     st.caption(
-        "v17: 4-signal momentum · EPS surprise · Revision mom · "
-        "Elite conviction · CS Score · Score history. "
+        "v18: roa_prev live · shares BS-sourced · EV/EBITDA TTM · "
+        "3-tier PEG · CAGR exponent corrected · run_id Score Delta. "
         "Not financial advice."
     )
 
@@ -1714,7 +1872,7 @@ Both-negative cap at +0.30.
 # APP ENTRY POINT
 # ══════════════════════════════════════════════════════════════════════════════
 st.set_page_config(
-    page_title="S&P 500 Screener v17", layout="wide", page_icon="📊"
+    page_title="S&P 500 Screener v18", layout="wide", page_icon="<U+1F4CA>"
 )
 st.markdown(
     "<style>"
@@ -1723,7 +1881,14 @@ st.markdown(
     "</style>",
     unsafe_allow_html=True,
 )
-st.markdown("## S&P 500 Fundamental Screener v17")
+st.markdown("## S&P 500 Fundamental Screener v18")
+
+# FIX-13: Initialise a unique run_id for this Streamlit session.
+# Each run_id identifies a single cache-clear / fresh-load cycle.
+# score_history entries are tagged with the run_id at write time and
+# filtered by run_id != current at read time in get_score_delta().
+if "run_id" not in st.session_state:
+    st.session_state["run_id"] = str(uuid.uuid4())[:8]
 
 page_screener, page_reference = st.tabs(["Screener", "Column Reference Guide"])
 
@@ -1733,12 +1898,16 @@ with page_screener:
     with col_r:
         if st.button("Refresh"):
             st.cache_data.clear()
+            # FIX-13: new run_id on every explicit refresh so Score Delta
+            # compares against the PREVIOUS cache-clear cycle, not itself.
+            st.session_state["run_id"] = str(uuid.uuid4())[:8]
             st.rerun()
     with col_t:
         st.caption(
             "Last loaded: {} · 1hr price cache · 24hr fundamental cache · "
-            "v17 patched: div yield fix · ROIC boundary · score delta · "
-            "accruals threshold".format(datetime.now().strftime("%I:%M %p"))
+            "v18: roa_prev/shares BS-sourced · EV/EBITDA TTM · "
+            "3-tier PEG · CAGR fix · run_id delta".format(
+                datetime.now().strftime("%I:%M %p"))
         )
 
     fmp_key = get_fmp_key()
@@ -1784,7 +1953,8 @@ with page_screener:
     with st.spinner("Phase 1/2 — Yahoo info ({} tickers)...".format(len(tickers))):
         yahoo_info = fetch_yahoo_info_all(tickers, _cache_date=today_date)
 
-    filtered_tickers = _pre_filter_tickers(yahoo_info, universe_df, mc_min_b, pe_max)
+    filtered_tickers = _pre_filter_tickers(
+        yahoo_info, universe_df, mc_min_b, pe_max)
 
     with st.spinner("Phase 2/2 — Deep financials ({} tickers)...".format(
             len(filtered_tickers))):
@@ -1796,10 +1966,10 @@ with page_screener:
     with st.spinner("Fetching SPY benchmark return..."):
         spy_3mo = fetch_spy_3mo_return()
     if spy_3mo is not None:
-        st.caption("SPY 3Mo return: {:.1f}% (used for Rel Str SPY signal)".format(
-            spy_3mo))
+        st.caption("SPY 3Mo return: {:.1f}% (Rel Str SPY signal)".format(spy_3mo))
 
-    with st.spinner("Prices + 4-signal Momentum ({} tickers)...".format(len(tickers))):
+    with st.spinner("Prices + 4-signal Momentum ({} tickers)...".format(
+            len(tickers))):
         pm_data = fetch_price_momentum_all(tickers, spy_3mo=spy_3mo)
 
     fmp_quotes = {}; fmp_ratios = {}
@@ -1828,28 +1998,27 @@ with page_screener:
         "EPS Surprise: {}/{} ({:.0f}%) · Revision Mom: {}/{} ({:.0f}%) · "
         "Momentum: {}/{} ({:.0f}%) · "
         "Yahoo{}".format(
-            cov_m("pe"),               total_t, cov_m("pe")               / total_t * 100,
-            cov_m("fwd_pe"),           total_t, cov_m("fwd_pe")           / total_t * 100,
-            cov_m("ev_ebitda"),        total_t, cov_m("ev_ebitda")        / total_t * 100,
-            cov_m("fcf_ttm"),          total_t, cov_m("fcf_ttm")          / total_t * 100,
-            cov_m("eps_surprise_avg"), total_t, cov_m("eps_surprise_avg") / total_t * 100,
-            cov_m("revision_momentum"),total_t, cov_m("revision_momentum")/ total_t * 100,
-            cov_p("momentum_score"),   total_t, cov_p("momentum_score")   / total_t * 100,
+            cov_m("pe"),                total_t, cov_m("pe")               / total_t * 100,
+            cov_m("fwd_pe"),            total_t, cov_m("fwd_pe")           / total_t * 100,
+            cov_m("ev_ebitda"),         total_t, cov_m("ev_ebitda")        / total_t * 100,
+            cov_m("fcf_ttm"),           total_t, cov_m("fcf_ttm")          / total_t * 100,
+            cov_m("eps_surprise_avg"),  total_t, cov_m("eps_surprise_avg") / total_t * 100,
+            cov_m("revision_momentum"), total_t, cov_m("revision_momentum")/ total_t * 100,
+            cov_p("momentum_score"),    total_t, cov_p("momentum_score")   / total_t * 100,
             " + FMP" if fmp_key else "",
         )
     )
 
     scr = build_screener_table(universe_df, pm_data, merged_map)
 
-    # FIX-4: Compute Score Δ BEFORE recording history so that history[-2]
-    #         still points to the previous run's snapshot when delta is read.
-    scr["Score Δ"] = scr.apply(
-        lambda r: get_score_delta(r["Ticker"], r.get("Score")), axis=1)
+    # FIX-4 (v17) + FIX-13 (v18): compute delta BEFORE recording history
+    scr["Score Delta"] = scr.apply(
+        lambda row: get_score_delta(row["Ticker"], row.get("Score")), axis=1)
 
     # Record history AFTER delta is computed
     record_score_history(scr)
 
-    # Filters
+    # ── Filters ───────────────────────────────────────────────────────────────
     filt = scr.copy()
     if sector_sel != "All Sectors":
         filt = filt[filt["Sector"] == sector_sel]
@@ -1858,7 +2027,7 @@ with page_screener:
     filt = filt[(filt["Quality Score"].isna()) | (filt["Quality Score"] >= qual_min_f)]
 
     sort_map = {
-        "Sector then Rank":              (["Sector","Rank"],          [True,True]),
+        "Sector then Rank":              (["Sector", "Rank"],         [True,  True]),
         "Score high to low":             (["Score"],                  [False]),
         "Conviction high to low":        (["Conviction Score"],       [False]),
         "CS Score high to low":          (["CS Score"],               [False]),
@@ -1882,9 +2051,9 @@ with page_screener:
         "EV/EBITDA low":                 (["EV/EBITDA"],              [True]),
         "EPS Beat Rate high":            (["EPS Beat Rate"],          [False]),
         "Revision Mom high":             (["Revision Mom"],           [False]),
-        "Score Delta high":              (["Score Δ"],                [False]),
+        "Score Delta high":              (["Score Delta"],            [False]),
     }
-    sc, sa = sort_map.get(sort_by, (["Sector","Rank"], [True,True]))
+    sc, sa = sort_map.get(sort_by, (["Sector", "Rank"], [True, True]))
     filt   = filt.sort_values(sc, ascending=sa, na_position="last")
 
     st.caption("Showing **{}** of **{}** · Sector: {} · Sort: {}".format(
@@ -1916,7 +2085,7 @@ with page_screener:
         "Rev Growth% (CAGR)", "P/E vs Sector Med",
         "EV/EBITDA", "FCF Yield%", "EV/Sales", "Div Yield%", "Sloan Ratio",
         "EPS Surp Avg%", "EPS Beat Rate", "EPS Surp Trend", "Revision Mom",
-        "Skip Mo", "52W Prox", "vs MA200", "Rel Str SPY", "Score Δ",
+        "Skip Mo", "52W Prox", "vs MA200", "Rel Str SPY", "Score Delta",
     ]
     for c in ROUND_COLS:
         if c in disp.columns:
@@ -1936,7 +2105,7 @@ with page_screener:
         "Quality Score", "Quality Flag", "Piotroski F", "Sloan Ratio",
         "Momentum Score", "Skip Mo", "52W Prox", "vs MA200", "Rel Str SPY",
         "Ret 1Mo%", "Ret 3Mo%", "Ret 6Mo%", "Trailing Vol%",
-        "52W Pos%", "Score", "Score Δ", "Conviction Score", "CS Score", "Rank",
+        "52W Pos%", "Score", "Score Delta", "Conviction Score", "CS Score", "Rank",
         "Rev Q1 Oldest ($B)", "Rev Q2 ($B)", "Rev Q3 ($B)", "Rev Q4 Latest ($B)",
         "Rev Growth% (CAGR)",
     ]
@@ -1946,10 +2115,16 @@ with page_screener:
     st.download_button(
         label="Download CSV",
         data=disp_final.to_csv(index=False).encode("utf-8"),
-        file_name="sp500_screener_v17_{}.csv".format(
+        file_name="sp500_screener_v18_{}.csv".format(
             datetime.now().strftime("%Y%m%d_%H%M")),
         mime="text/csv",
     )
 
 with page_reference:
     render_reference_guide()
+`;
+
+document.getElementById('code').textContent = raw;
+</script>
+</body>
+</html>

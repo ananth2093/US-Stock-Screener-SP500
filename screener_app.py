@@ -1,15 +1,28 @@
-# screener_app.py v14
+# screener_app.py v15
 # ─────────────────────────────────────────────────────────────────────────────
-# v14 CHANGES from v13:
-#  1. UI CLEAN  — Removed subtitle caption under main heading
-#  2. UI CLEAN  — Removed pre-filter + FMP tier st.caption messages
-#  3. UI CLEAN  — Removed render_sector_kpi_panel() call (sector KPI block)
-#  4. FIX       — Momentum/52W/Price None fix: replaced batch yf.download()
-#                 with per-ticker yf.Ticker(t).history() which always returns
-#                 a flat DataFrame (Close, High, Low, Volume) — no MultiIndex
-#                 ambiguity. 52W hi/lo now derived from 12-month daily history.
-#                 Monthly returns resampled from daily history via .resample().
-#  5. UI CLEAN  — Removed "Data Sources" column from display table and COLS
+# v15 CHANGES from v14:
+#  1. SCORING UPGRADE — Replaced percentile_score() with three-function
+#     elite normalisation pipeline:
+#       winsorise()        — caps extremes at 1st/99th percentile so a single
+#                            outlier (e.g. NVDA P/E=65) cannot compress all
+#                            other stocks into a narrow score band.
+#       mad_zscore()       — Median Absolute Deviation z-score; robust to
+#                            outliers unlike mean/std z-score. Formula:
+#                            (x − median) / (1.4826 × MAD). The 1.4826
+#                            consistency factor makes MAD equivalent to std
+#                            for normally distributed data.
+#       elite_factor_score() — full pipeline: winsorise → flip sign if
+#                            lower-is-better → MAD z-score → clip [-3,+3]
+#                            → rescale to [0,100]. Drop-in replacement for
+#                            every percentile_score() call.
+#  2. SCORING UPGRADE — compute_rank_by_sector() now calls
+#     elite_factor_score() for all four factor sub-scores (_s_val, _s_peg,
+#     _s_mom, _s_etraj). Quality sub-score keeps its existing min-max
+#     rescale (already outlier-resistant via log transform).
+#  3. KEPT INTACT — All data-fetch logic, FMP integration, ROIC computation,
+#     conviction score, reference guide, and UI are unchanged from v14.
+#  4. REFERENCE GUIDE updated — Ranking & Score tab now explains MAD
+#     normalisation and why it replaces percentile rank.
 # ─────────────────────────────────────────────────────────────────────────────
 
 import streamlit as st
@@ -33,7 +46,7 @@ except ImportError:
     st.stop()
 
 # ── Constants ──────────────────────────────────────────────────────────────────
-MIN_GROWTH_PCT_FOR_PEG = 5.0
+MIN_GROWTH_PCT_FOR_PEG   = 5.0
 FETCH_TIMEOUT_PER_TICKER = 45
 
 SECTOR_FACTOR_WEIGHTS = {
@@ -108,7 +121,9 @@ def get_fmp_key():
         return None
 
 
-# ── Helpers ────────────────────────────────────────────────────────────────────
+# ══════════════════════════════════════════════════════════════════════════════
+# HELPERS
+# ══════════════════════════════════════════════════════════════════════════════
 def to_num(x):
     return pd.to_numeric(x, errors="coerce")
 
@@ -143,7 +158,141 @@ def fmt_mc(val):
     return "${:.0f}M".format(val / 1e6)
 
 
-def percentile_score(series: pd.Series, ascending=True) -> pd.Series:
+# ── v15 NEW: Elite normalisation pipeline ─────────────────────────────────────
+
+def winsorise(series: pd.Series, lower: float = 0.01, upper: float = 0.99) -> pd.Series:
+    """
+    Cap extreme values at the lower and upper percentile before scoring.
+
+    Why: A single outlier (e.g. NVDA P/E = 65 while sector median is 25)
+    would otherwise compress every other stock's percentile rank into a
+    narrow band, destroying signal resolution between normal stocks.
+
+    Parameters
+    ----------
+    series : pd.Series   Raw factor values (may contain NaN).
+    lower  : float       Lower percentile cap (default 1st  pct = 0.01).
+    upper  : float       Upper percentile cap (default 99th pct = 0.99).
+
+    Returns
+    -------
+    pd.Series with values clipped to [q_lower, q_upper]; NaN preserved.
+    """
+    # Compute quantiles on non-null values only
+    valid = series.dropna()
+    if valid.empty:
+        return series.copy()
+    q_lo = valid.quantile(lower)
+    q_hi = valid.quantile(upper)
+    return series.clip(lower=q_lo, upper=q_hi)
+
+
+def mad_zscore(series: pd.Series) -> pd.Series:
+    """
+    Median Absolute Deviation (MAD) z-score normalisation.
+
+    Why MAD over standard z-score: The standard z-score uses mean and
+    standard deviation — both are pulled by outliers. MAD uses the median
+    and the median of absolute deviations, which have a 50% breakdown
+    point (up to half the data can be extreme before the statistic
+    becomes misleading). This gives each stock a fairer relative score.
+
+    Formula:  z_i = (x_i − median(x)) / (1.4826 × MAD)
+    where:    MAD = median(|x_i − median(x)|)
+              1.4826 = consistency factor that makes MAD equivalent
+                       to std deviation for normally distributed data.
+
+    Returns
+    -------
+    pd.Series of z-scores; NaN inputs produce NaN outputs.
+    Edge case: if MAD == 0 (all values identical after winsorising),
+    returns a zero series rather than dividing by zero.
+    """
+    valid = series.dropna()
+    if valid.empty:
+        return pd.Series(0.0, index=series.index)
+
+    med = valid.median()
+    mad = (valid - med).abs().median()
+
+    if mad == 0:
+        # All values are identical → no information → return zeros
+        return pd.Series(0.0, index=series.index)
+
+    return (series - med) / (1.4826 * mad)
+
+
+def elite_factor_score(series: pd.Series, ascending: bool = True) -> pd.Series:
+    """
+    Full four-step elite normalisation pipeline.
+
+    Step 1 — Winsorise at 1st / 99th percentile.
+              Prevents a single extreme value from dominating ranks.
+
+    Step 2 — Sign flip when lower values are BETTER (ascending=True).
+              e.g. P/E: lower P/E should score higher, so we negate
+              the series before z-scoring so the maths works uniformly.
+
+    Step 3 — MAD z-score.
+              Robust standardisation centred on the median.
+
+    Step 4 — Clip to [-3, +3].
+              Values beyond ±3 MAD-std are genuine outliers even after
+              winsorising; clipping prevents them skewing the final rescale.
+
+    Step 5 — Rescale to [0, 100].
+              Maps the clipped z-scores linearly to a 0–100 range so the
+              output is directly comparable with the quality sub-score and
+              can be multiplied by sector weights.
+
+    Missing values (NaN) receive a score of 0.0, consistent with the
+    original percentile_score() behaviour and the missing-factor penalty.
+
+    Parameters
+    ----------
+    series    : pd.Series   Raw factor values (may contain NaN).
+    ascending : bool        True  → lower raw value = higher score (P/E, PEG).
+                            False → higher raw value = higher score (Momentum).
+
+    Returns
+    -------
+    pd.Series of floats in [0, 100] with NaN replaced by 0.0.
+    """
+    if series.dropna().empty:
+        return pd.Series(0.0, index=series.index)
+
+    # Step 1: winsorise (preserves NaN)
+    ws = winsorise(series.copy())
+
+    # Step 2: flip sign so that "better" always maps to "larger" after z-score
+    if ascending:
+        ws = -ws   # lower raw value → higher (less negative) after flip
+
+    # Step 3: MAD z-score
+    z = mad_zscore(ws)
+
+    # Step 4: clip to [-3, +3]
+    z = z.clip(lower=-3.0, upper=3.0)
+
+    # Step 5: rescale to [0, 100]
+    z_min = z.min()
+    z_max = z.max()
+    if z_max > z_min:
+        scaled = (z - z_min) / (z_max - z_min) * 100.0
+    else:
+        # All values identical after clipping → assign 50 (neutral)
+        scaled = pd.Series(50.0, index=series.index)
+
+    # Replace NaN (from original missing values) with 0.0
+    return scaled.fillna(0.0)
+
+
+# ── Legacy percentile_score kept for reference (NOT used in scoring) ──────────
+def percentile_score(series: pd.Series, ascending: bool = True) -> pd.Series:
+    """
+    DEPRECATED in v15 — retained only for backward compatibility if any
+    external caller still references it.  Scoring now uses elite_factor_score().
+    """
     result = pd.Series(index=series.index, dtype=float)
     valid  = series.notna()
     if valid.sum() == 0:
@@ -202,23 +351,8 @@ def fetch_sp500_constituents():
 
 # ══════════════════════════════════════════════════════════════════════════════
 # PRICES + MOMENTUM — per-ticker yf.Ticker(t).history()
-# v14 FIX: replaced batch yf.download() with per-ticker .history() calls.
-# .history() always returns a flat DataFrame with columns:
-#   Open, High, Low, Close, Volume, Dividends, Stock Splits
-# No MultiIndex, no group_by ambiguity, no version-dependent column shapes.
-# 52W hi/lo derived from 12-month daily history (more reliable than fast_info).
-# Monthly returns resampled from daily Close via .resample("ME").last().
 # ══════════════════════════════════════════════════════════════════════════════
 def _fetch_price_momentum_one(t):
-    """
-    Fetch price, 52W hi/lo, momentum returns, and trailing volatility
-    for a single ticker using yf.Ticker(t).history().
-
-    Returns a dict with keys:
-        price, hi52, lo52,
-        ret_1mo, ret_3mo, ret_6mo,
-        trailing_vol, momentum_score
-    """
     result = {
         "price":          None,
         "hi52":           None,
@@ -231,13 +365,10 @@ def _fetch_price_momentum_one(t):
     }
     try:
         obj  = yf.Ticker(t)
-        # 12 months of daily history covers both 52W range and 6-month returns
         hist = obj.history(period="12mo", interval="1d", auto_adjust=True)
 
         if hist is None or hist.empty:
             return t, result
-
-        # Ensure Close column exists (auto_adjust uses 'Close' not 'Adj Close')
         if "Close" not in hist.columns:
             return t, result
 
@@ -245,13 +376,10 @@ def _fetch_price_momentum_one(t):
         if closes.empty:
             return t, result
 
-        # ── Current price + 52W range ─────────────────────────────────────
         result["price"] = float(closes.iloc[-1])
         result["hi52"]  = float(closes.max())
         result["lo52"]  = float(closes.min())
 
-        # ── Monthly returns via resampling ────────────────────────────────
-        # Resample daily closes to month-end; need at least 7 bars for 6Mo ret
         monthly = closes.resample("ME").last().dropna()
         if len(monthly) < 2:
             return t, result
@@ -261,7 +389,6 @@ def _fetch_price_momentum_one(t):
             return t, result
 
         def ret_mo(n):
-            # index -(n+1) gives the close n months ago
             idx = -(n + 1)
             if abs(idx) > len(monthly):
                 return None
@@ -275,7 +402,6 @@ def _fetch_price_momentum_one(t):
         result["ret_3mo"] = r3
         result["ret_6mo"] = r6
 
-        # ── Trailing 90-day annualised volatility ─────────────────────────
         if len(closes) >= 20:
             daily_rets = closes.pct_change().dropna().tail(90)
             if len(daily_rets) >= 15:
@@ -283,7 +409,6 @@ def _fetch_price_momentum_one(t):
                     daily_rets.std() * np.sqrt(252) * 100.0
                 )
 
-        # ── Skip-month momentum (6Mo − 1Mo) / vol ────────────────────────
         t_vol = result["trailing_vol"]
         if r6 is not None and r1 is not None:
             skip_raw = r6 - r1
@@ -300,10 +425,6 @@ def _fetch_price_momentum_one(t):
 
 @st.cache_data(ttl=3600)
 def fetch_price_momentum_all(tickers):
-    """
-    Per-ticker price + momentum fetch using yf.Ticker(t).history().
-    Runs concurrently in chunks. Returns a unified dict keyed by ticker.
-    """
     tl       = list(tickers)
     out      = {t: {} for t in tl}
     CHUNK    = 25
@@ -367,7 +488,8 @@ def _fetch_yahoo_info_one(t):
             fi = obj.fast_info
             if fi is not None:
                 mc_fi = sf(getattr(fi, "market_cap", None))
-                if mc_fi: result["mc"] = mc_fi
+                if mc_fi:
+                    result["mc"] = mc_fi
         except Exception:
             pass
 
@@ -553,12 +675,8 @@ def _fetch_yahoo_deep_one(t):
                 op_inc_ttm   = float(qfin.loc[op_inc_row].dropna().head(4).sum())
                 eff_tax_rate = 0.21
                 if tax_row and pretax_row:
-                    tax_ttm    = float(
-                        qfin.loc[tax_row].dropna().head(4).sum()
-                    )
-                    pretax_ttm = float(
-                        qfin.loc[pretax_row].dropna().head(4).sum()
-                    )
+                    tax_ttm    = float(qfin.loc[tax_row].dropna().head(4).sum())
+                    pretax_ttm = float(qfin.loc[pretax_row].dropna().head(4).sum())
                     if pretax_ttm > 0 and tax_ttm >= 0:
                         computed_rate = tax_ttm / pretax_ttm
                         if 0 < computed_rate < 0.6:
@@ -608,7 +726,7 @@ def _fetch_yahoo_deep_one(t):
                 cash_use = 0
                 if cash_val is not None:
                     rev4_vals = result["rev4"]
-                    rev_ttm = None
+                    rev_ttm   = None
                     if all(v is not None for v in rev4_vals):
                         rev_ttm = sum(rev4_vals)
                     if rev_ttm is not None and rev_ttm > 0:
@@ -631,7 +749,7 @@ def _fetch_yahoo_deep_one(t):
 
 @st.cache_data(ttl=86400)
 def fetch_yahoo_deep_financials(tickers_filtered, _cache_date=None):
-    tl = list(tickers_filtered)
+    tl  = list(tickers_filtered)
     out = {}
     if not tl:
         return out
@@ -675,9 +793,9 @@ def fetch_yahoo_deep_financials(tickers_filtered, _cache_date=None):
 def _pre_filter_tickers(info_map, universe_df, mc_min_b, pe_max):
     keep = []
     for t in universe_df["Ticker"]:
-        d    = info_map.get(t, {})
-        mc   = d.get("mc")
-        pe   = d.get("pe")
+        d     = info_map.get(t, {})
+        mc    = d.get("mc")
+        pe    = d.get("pe")
         mc_ok = (mc is None) or (mc >= mc_min_b * 1e9)
         pe_ok = (pe is None) or (pe <= pe_max)
         if mc_ok and pe_ok:
@@ -851,30 +969,29 @@ def merge_all_sources(yahoo_data, fmp_quotes, fmp_ratios, tickers):
                     return v
             return None
 
-        pe_val  = first(fq.get("pe"), fr.get("fmp_trailing_pe"), yb.get("pe"))
-        pe_src  = (
-            "FMP-quote"   if fq.get("pe") is not None else
-            "FMP-ratios"  if fr.get("fmp_trailing_pe") is not None else
+        pe_val = first(fq.get("pe"), fr.get("fmp_trailing_pe"), yb.get("pe"))
+        pe_src = (
+            "FMP-quote"  if fq.get("pe")              is not None else
+            "FMP-ratios" if fr.get("fmp_trailing_pe") is not None else
             yb.get("pe_src", "Yahoo")
         )
 
         fwd_pe  = yb.get("fwd_pe")
-
         peg_val = first(fr.get("peg"), yb.get("peg"))
         peg_src = (
-            "FMP-ratios" if fr.get("peg") is not None else
+            "FMP-ratios" if fr.get("peg")  is not None else
             yb.get("peg_src", "Yahoo") if yb.get("peg") is not None else "—"
         )
 
-        roic      = first(fr.get("roic"),         yb.get("roic"))
-        roe       = first(fr.get("roe"),           yb.get("roe"))
-        ic        = first(fr.get("int_coverage"),  yb.get("int_coverage"))
-        om        = first(fr.get("op_margin"),     yb.get("op_margin"))
-        de        = first(fr.get("debt_eq"),        yb.get("debt_eq"))
+        roic      = first(fr.get("roic"),        yb.get("roic"))
+        roe       = first(fr.get("roe"),          yb.get("roe"))
+        ic        = first(fr.get("int_coverage"), yb.get("int_coverage"))
+        om        = first(fr.get("op_margin"),    yb.get("op_margin"))
+        de        = first(fr.get("debt_eq"),       yb.get("debt_eq"))
         eps_g     = yb.get("eps_growth")
         g_src     = "Yahoo" if eps_g is not None else None
         earn_traj = yb.get("earn_traj")
-        mc        = first(fq.get("mc"),  yb.get("mc"))
+        mc        = first(fq.get("mc"), yb.get("mc"))
         rev4      = yb.get("rev4", [None, None, None, None])
 
         merged[t] = {
@@ -981,8 +1098,24 @@ def compute_conviction_scores(scr):
     return scr.drop(columns=["_completeness", "_sec_discount"])
 
 
-# ── Ranking ────────────────────────────────────────────────────────────────────
+# ══════════════════════════════════════════════════════════════════════════════
+# RANKING — v15: uses elite_factor_score() instead of percentile_score()
+# ══════════════════════════════════════════════════════════════════════════════
 def compute_rank_by_sector(scr):
+    """
+    Compute per-sector composite Score and ordinal Rank.
+
+    v15 change: All four factor sub-scores (_s_val, _s_peg, _s_mom,
+    _s_etraj) now use elite_factor_score() — the winsorise → MAD z-score
+    → clip → rescale pipeline — instead of the raw percentile rank.
+
+    The quality sub-score retains its existing min-max rescale because
+    compute_quality_score() already applies a log transform that makes it
+    outlier-resistant.
+
+    Everything else (sector weights, missing-factor penalty, rank
+    assignment) is identical to v14.
+    """
     scr = scr.copy()
     scr["Score"] = pd.NA
     scr["Rank"]  = pd.NA
@@ -995,28 +1128,41 @@ def compute_rank_by_sector(scr):
 
         W = SECTOR_FACTOR_WEIGHTS.get(sector, DEFAULT_FACTOR_WEIGHTS)
 
-        pe_input         = elig["Fwd P/E"].fillna(elig["P/E"])
-        elig["_s_val"]   = percentile_score(pe_input,              ascending=True)
-        elig["_s_peg"]   = percentile_score(elig["PEG"],            ascending=True)
-        elig["_s_mom"]   = percentile_score(elig["Momentum Score"], ascending=False)
-        elig["_s_etraj"] = percentile_score(elig["Earn Traj"],      ascending=False)
+        # ── Valuation sub-score (lower Fwd P/E or P/E = better) ──────────
+        pe_input       = elig["Fwd P/E"].fillna(elig["P/E"])
+        elig["_s_val"] = elite_factor_score(pe_input, ascending=True)
 
+        # ── PEG sub-score (lower PEG = better) ───────────────────────────
+        elig["_s_peg"] = elite_factor_score(elig["PEG"], ascending=True)
+
+        # ── Momentum sub-score (higher momentum = better) ─────────────────
+        elig["_s_mom"] = elite_factor_score(elig["Momentum Score"], ascending=False)
+
+        # ── Earnings trajectory sub-score (higher = better) ───────────────
+        elig["_s_etraj"] = elite_factor_score(elig["Earn Traj"], ascending=False)
+
+        # ── Quality sub-score — keep existing min-max rescale ─────────────
+        # compute_quality_score() uses log1p transform (already robust).
+        # Min-max rescale within sector is sufficient here.
         qs    = elig["Quality Score"]
-        q_min = qs.min(); q_max = qs.max()
+        q_min = qs.min()
+        q_max = qs.max()
         if pd.notna(q_min) and pd.notna(q_max) and q_max > q_min:
             elig["_s_quality"] = (qs - q_min) / (q_max - q_min) * 100.0
         else:
             elig["_s_quality"] = qs.fillna(0.0)
         elig["_s_quality"] = elig["_s_quality"].fillna(0.0)
 
+        # ── Weighted composite ─────────────────────────────────────────────
         raw = (
-            W["valuation"] * elig["_s_val"]      +
-            W["quality"]   * elig["_s_quality"]  +
-            W["peg"]       * elig["_s_peg"]      +
-            W["earn_traj"] * elig["_s_etraj"]    +
+            W["valuation"] * elig["_s_val"]     +
+            W["quality"]   * elig["_s_quality"] +
+            W["peg"]       * elig["_s_peg"]     +
+            W["earn_traj"] * elig["_s_etraj"]   +
             W["momentum"]  * elig["_s_mom"]
         )
 
+        # ── Missing-factor penalty ─────────────────────────────────────────
         factor_cols = ["P/E", "PEG", "Quality Score", "Earn Traj", "Momentum Score"]
         penalties   = elig.apply(
             lambda r: missing_factor_penalty(r, factor_cols), axis=1
@@ -1034,10 +1180,6 @@ def compute_rank_by_sector(scr):
 
 # ── Build screener table ───────────────────────────────────────────────────────
 def build_screener_table(universe_df, pm_map, merged_map):
-    """
-    v14: pm_map is the unified price+momentum dict from fetch_price_momentum_all().
-    Replaces separate prices_map + momentum_map parameters.
-    """
     rows = []
     for _, r in universe_df.iterrows():
         t   = r["Ticker"]
@@ -1064,7 +1206,6 @@ def build_screener_table(universe_df, pm_map, merged_map):
         de        = to_num(fi.get("debt_eq"))
         earn_traj = to_num(fi.get("earn_traj"))
 
-        # 52W position — derived from history-based hi/lo (more reliable)
         pos52 = None
         if pd.notna(price) and pd.notna(hi) and pd.notna(lo) and hi != lo:
             pos52 = float((price - lo) / (hi - lo) * 100.0)
@@ -1074,7 +1215,8 @@ def build_screener_table(universe_df, pm_map, merged_map):
         growth = revenue_growth_pct_cagr([rq1, rq2, rq3, rq4])
 
         peg_direct = to_num(fi.get("peg"))
-        peg = None; peg_method = "—"
+        peg        = None
+        peg_method = "—"
         if pd.notna(peg_direct):
             peg        = float(peg_direct)
             peg_method = fi.get("peg_src") or "Yahoo"
@@ -1132,7 +1274,7 @@ def build_screener_table(universe_df, pm_map, merged_map):
     if scr.empty:
         return scr
 
-    total_sp500_mc = scr["Mkt Cap"].sum()
+    total_sp500_mc   = scr["Mkt Cap"].sum()
     scr["MC% of S&P500"] = (
         (scr["Mkt Cap"] / total_sp500_mc * 100.0) if total_sp500_mc > 0 else None
     )
@@ -1300,9 +1442,24 @@ Returns are derived from 12-month daily price history resampled to month-end clo
 
     with tab_rank:
         st.markdown("""
-**Score (0–100)**
+**Score (0–100) — v15 MAD Z-Score Normalisation**
 
-Composite percentile score within GICS sector using sector-adaptive weights.
+Composite score within GICS sector using sector-adaptive weights.
+All four factor sub-scores now use the **elite normalisation pipeline**:
+
+1. **Winsorise** — caps values at 1st/99th percentile so one outlier
+   (e.g. NVDA P/E = 65 in an IT sector with median ~28) cannot compress
+   every other stock into a narrow band.
+2. **MAD Z-Score** — `(x − median) / (1.4826 × MAD)`. Uses median and
+   Median Absolute Deviation instead of mean/std. 50% breakdown point
+   vs 0% for standard z-score — immune to outliers.
+3. **Clip to [−3, +3]** — removes residual noise beyond 3 MAD-std.
+4. **Rescale to [0, 100]** — linear map for direct weight multiplication.
+
+The Quality sub-score keeps its existing min-max rescale because
+`compute_quality_score()` already applies a log transform.
+
+---
 
 | Sector | Val | Quality | PEG | Earn | Mom |
 |---|---|---|---|---|---|
@@ -1350,10 +1507,11 @@ Last four fiscal quarters of total revenue, ordered oldest → newest.
 
     st.markdown("---")
     st.markdown(
-        "**Data sources v14:** Yahoo Finance (primary) · FMP bonus if key available · "
-        "Price + Momentum + 52W from per-ticker history() — no MultiIndex issues · "
+        "**Data sources v15:** Yahoo Finance (primary) · FMP bonus if key available · "
+        "Price + Momentum + 52W from per-ticker history() · "
         "ROIC + Revenue from Phase 2 · Fwd P/E from Yahoo only · "
-        "Earn Traj both-negative cap at +0.30 · Sector-adaptive scoring. "
+        "Earn Traj both-negative cap at +0.30 · "
+        "**Scoring: MAD Z-Score + Winsorise (v15)** — outlier-robust normalisation. "
         "_Nothing here is financial advice._"
     )
 
@@ -1362,7 +1520,7 @@ Last four fiscal quarters of total revenue, ordered oldest → newest.
 # APP ENTRY POINT
 # ══════════════════════════════════════════════════════════════════════════════
 st.set_page_config(
-    page_title="S&P 500 Screener v14", layout="wide", page_icon="📊"
+    page_title="S&P 500 Screener v15", layout="wide", page_icon="📊"
 )
 st.markdown(
     "<style>"
@@ -1372,7 +1530,7 @@ st.markdown(
     unsafe_allow_html=True,
 )
 
-st.markdown("## S&P 500 Fundamental Screener v14")
+st.markdown("## S&P 500 Fundamental Screener v15")
 
 page_screener, page_reference = st.tabs(["Screener", "Column Reference Guide"])
 
@@ -1387,7 +1545,8 @@ with page_screener:
             st.rerun()
     with col_t:
         st.caption(
-            "Last loaded: {} · Prices + Momentum: 1hr cache · Fundamentals: 24hr cache".format(
+            "Last loaded: {} · Prices + Momentum: 1hr cache · Fundamentals: 24hr cache · "
+            "Scoring: MAD Z-Score + Winsorise (v15)".format(
                 datetime.now().strftime("%I:%M %p")
             )
         )
@@ -1476,7 +1635,7 @@ with page_screener:
     # ── Merge Phase 1 + Phase 2 ────────────────────────────────────────────
     yahoo_fundamentals = merge_yahoo_phases(yahoo_info, yahoo_deep, tickers)
 
-    # ── Price + Momentum (per-ticker history — v14 fix) ────────────────────
+    # ── Price + Momentum ───────────────────────────────────────────────────
     with st.spinner(
         "Fetching prices + momentum for {} tickers (per-ticker history)...".format(
             len(tickers)
@@ -1532,7 +1691,7 @@ with page_screener:
         )
     )
 
-    # ── Build screener (unified pm_data — v14) ─────────────────────────────
+    # ── Build screener ─────────────────────────────────────────────────────
     scr = build_screener_table(universe_df, pm_data, merged_map)
 
     # ── Apply filters ──────────────────────────────────────────────────────
@@ -1550,43 +1709,44 @@ with page_screener:
     ]
 
     sort_map = {
-        "Sector then Rank":              (["Sector", "Rank"],         [True, True]),
-        "Score high to low":             (["Score"],                  [False]),
-        "Conviction high to low":        (["Conviction Score"],       [False]),
-        "MC% of S&P500 high to low":     (["MC% of S&P500"],         [False]),
-        "Price low to high":             (["Price"],                  [True]),
-        "Price high to low":             (["Price"],                  [False]),
-        "Mkt Cap high to low":           (["Mkt Cap"],                [False]),
-        "PE low to high":                (["P/E"],                    [True]),
-        "Fwd PE low to high":            (["Fwd P/E"],                [True]),
-        "PEG low to high":               (["PEG"],                    [True]),
-        "Quality Score high":            (["Quality Score"],          [False]),
-        "ROIC high to low":              (["ROIC%"],                  [False]),
-        "ROE high to low":               (["ROE%"],                   [False]),
-        "Earn Traj high to low":         (["Earn Traj"],              [False]),
-        "Rev Growth high to low":        (["Rev Growth% (CAGR)"],     [False]),
-        "Momentum Score high":           (["Momentum Score"],         [False]),
-        "52W Pos low to high":           (["52W Pos%"],               [True]),
-        "P/E vs Sector Med low to high": (["P/E vs Sector Med"],      [True]),
+        "Sector then Rank":              (["Sector", "Rank"],     [True,  True]),
+        "Score high to low":             (["Score"],              [False]),
+        "Conviction high to low":        (["Conviction Score"],   [False]),
+        "MC% of S&P500 high to low":     (["MC% of S&P500"],     [False]),
+        "Price low to high":             (["Price"],              [True]),
+        "Price high to low":             (["Price"],              [False]),
+        "Mkt Cap high to low":           (["Mkt Cap"],            [False]),
+        "PE low to high":                (["P/E"],                [True]),
+        "Fwd PE low to high":            (["Fwd P/E"],            [True]),
+        "PEG low to high":               (["PEG"],                [True]),
+        "Quality Score high":            (["Quality Score"],      [False]),
+        "ROIC high to low":              (["ROIC%"],              [False]),
+        "ROE high to low":               (["ROE%"],               [False]),
+        "Earn Traj high to low":         (["Earn Traj"],          [False]),
+        "Rev Growth high to low":        (["Rev Growth% (CAGR)"], [False]),
+        "Momentum Score high":           (["Momentum Score"],     [False]),
+        "52W Pos low to high":           (["52W Pos%"],           [True]),
+        "P/E vs Sector Med low to high": (["P/E vs Sector Med"],  [True]),
     }
     sc, sa = sort_map.get(sort_by, (["Sector", "Rank"], [True, True]))
     filt   = filt.sort_values(sc, ascending=sa, na_position="last")
 
     st.caption(
-        "Showing **{}** of **{}** stocks · Sector: {} · Sort: {}".format(
+        "Showing **{}** of **{}** stocks · Sector: {} · Sort: {} · "
+        "Scoring: MAD Z-Score + Winsorise".format(
             len(filt), len(scr), sector_sel, sort_by
         )
     )
 
     # ── Display table ──────────────────────────────────────────────────────
     disp = filt.copy()
-    disp["Price ($)"]              = disp["Price"].round(2)
-    disp["Mkt Cap ($B)"]           = (disp["Mkt Cap"] / 1e9).round(2)
-    disp["MC% of S&P500"]          = disp["MC% of S&P500"].round(4)
-    disp["Rev Q1 Oldest ($B)"]     = (disp["Rev Q1 Oldest ($B)"] / 1e9).round(2)
-    disp["Rev Q2 ($B)"]            = (disp["Rev Q2 ($B)"] / 1e9).round(2)
-    disp["Rev Q3 ($B)"]            = (disp["Rev Q3 ($B)"] / 1e9).round(2)
-    disp["Rev Q4 Latest ($B)"]     = (disp["Rev Q4 Latest ($B)"] / 1e9).round(2)
+    disp["Price ($)"]          = disp["Price"].round(2)
+    disp["Mkt Cap ($B)"]       = (disp["Mkt Cap"] / 1e9).round(2)
+    disp["MC% of S&P500"]      = disp["MC% of S&P500"].round(4)
+    disp["Rev Q1 Oldest ($B)"] = (disp["Rev Q1 Oldest ($B)"] / 1e9).round(2)
+    disp["Rev Q2 ($B)"]        = (disp["Rev Q2 ($B)"]        / 1e9).round(2)
+    disp["Rev Q3 ($B)"]        = (disp["Rev Q3 ($B)"]        / 1e9).round(2)
+    disp["Rev Q4 Latest ($B)"] = (disp["Rev Q4 Latest ($B)"] / 1e9).round(2)
 
     disp["Quality Flag"] = disp.apply(
         lambda r: quality_flag(
@@ -1629,7 +1789,7 @@ with page_screener:
     st.download_button(
         label="Download CSV",
         data=disp_final.to_csv(index=False).encode("utf-8"),
-        file_name="sp500_screener_v14_{}.csv".format(
+        file_name="sp500_screener_v15_{}.csv".format(
             datetime.now().strftime("%Y%m%d_%H%M")
         ),
         mime="text/csv",

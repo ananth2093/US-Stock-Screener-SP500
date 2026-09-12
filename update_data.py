@@ -17,6 +17,43 @@ import pandas as pd
 import yfinance as yf
 
 
+# ── Market-open throttle for the Pi scheduler ────────────────────────────────
+def _is_us_market_open(dt: datetime | None = None) -> bool:
+    """Rough US equity market-open check (EST/EDT, no holidays)."""
+    from datetime import time as _time
+    from zoneinfo import ZoneInfo
+
+    if dt is None:
+        dt = datetime.now(ZoneInfo("US/Eastern"))
+    if dt.weekday() >= 5:
+        return False
+    return _time(9, 30) <= dt.time() < _time(16, 0)
+
+
+def _should_update(data_dir: Path) -> bool:
+    """Return True if we should run a full update now.
+
+    Logic:
+      - Always run if no snapshot exists yet.
+      - Run every hour while the US market is open.
+      - Run at most every 4 hours outside market hours.
+    """
+    last_update_file = data_dir / "last_update.json"
+    now = datetime.now(timezone.utc)
+    if not (data_dir / "latest_screener.parquet").exists():
+        return True
+    if not last_update_file.exists():
+        return True
+    try:
+        last_update = datetime.fromisoformat(last_update_file.read_text().strip())
+    except Exception:
+        return True
+    elapsed = (now - last_update).total_seconds()
+    if _is_us_market_open():
+        return elapsed >= 3500  # ~1 hour
+    return elapsed >= 4 * 3600 - 100  # ~4 hours
+
+
 # ── Minimal Streamlit stub ───────────────────────────────────────────────────
 class _NoOp:
     """A do-nothing object that is also a context manager and callable."""
@@ -122,9 +159,19 @@ def _build_streamlit_stub():
     return st
 
 
-# ── Run screener_app.py headlessly ───────────────────────────────────────────
+# ── Throttle check (Pi scheduler runs us every hour) ─────────────────────────
 SCRIPT_DIR = Path(__file__).parent.resolve()
 SCREENER_PATH = SCRIPT_DIR / "screener_app.py"
+
+data_dir = SCRIPT_DIR / "data"
+data_dir.mkdir(exist_ok=True)
+
+if not _should_update(data_dir):
+    print("Update skipped: outside market hours and recent update exists.")
+    raise SystemExit(0)
+
+
+# ── Run screener_app.py headlessly ───────────────────────────────────────────
 
 sys.modules["streamlit"] = _build_streamlit_stub()
 
@@ -144,10 +191,6 @@ if scr is None or prices_map is None:
         "screener_app.py did not produce `scr` and/or `prices_map`. "
         "Check the headless run output for errors."
     )
-
-# ── Prepare output directory ────────────────────────────────────────────────
-data_dir = SCRIPT_DIR / "data"
-data_dir.mkdir(exist_ok=True)
 
 # ── Save latest screener snapshot ─────────────────────────────────────────────
 parquet_path = data_dir / "latest_screener.parquet"
@@ -206,6 +249,9 @@ if price_history_path.exists():
 price_history["date"] = pd.to_datetime(price_history["date"]).dt.date
 price_history = price_history.drop_duplicates(subset=["date", "ticker"])
 price_history.to_parquet(price_history_path, index=False)
+
+# ── Mark successful update time ────────────────────────────────────────────────
+(data_dir / "last_update.json").write_text(datetime.now(timezone.utc).isoformat())
 
 # ── Summary ──────────────────────────────────────────────────────────────────
 print(f"Tickers processed: {len(prices_map)}")

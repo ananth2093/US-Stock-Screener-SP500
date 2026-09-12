@@ -1,0 +1,10 @@
+[Unit]
+Description=S&P 500 Screener Data Updater
+After=network.target
+
+[Service]
+Type=oneshot
+User=pi
+WorkingDirectory=/home/pi/screener
+EnvironmentFile=-/home/pi/screener/.env
+ExecStart=/home/pi/screener/venv/bin/python update_data.py

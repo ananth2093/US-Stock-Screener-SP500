@@ -1,0 +1,10 @@
+[Unit]
+Description=Run S&P 500 screener updater every hour
+Requires=pi-screener-updater.service
+
+[Timer]
+OnCalendar=*-*-* *:00:00
+Persistent=true
+
+[Install]
+WantedBy=timers.target

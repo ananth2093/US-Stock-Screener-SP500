@@ -44,10 +44,10 @@ FETCH_TIMEOUT_PER_TICKER = 30
 SLOAN_ACCRUALS_THRESHOLD = 0.08
 CAGR_EXPONENT            = 4.0 / 3.0
 
-YAHOO_DEEP_WORKERS = 3
-YAHOO_INFO_WORKERS = 4
-YAHOO_CHUNK_SIZE   = 20
-YAHOO_SLEEP_BASE   = 1.5
+YAHOO_DEEP_WORKERS = 4
+YAHOO_INFO_WORKERS = 5
+YAHOO_CHUNK_SIZE   = 15
+YAHOO_SLEEP_BASE   = 2.5
 MAX_RETRIES_YAHOO  = 3
 
 SECTOR_FACTOR_WEIGHTS = {
@@ -264,43 +264,6 @@ def _row_latest(df, candidates):
     vals = df.loc[row].dropna()
     return float(vals.iloc[0]) if not vals.empty else None
 
-
-def _run_chunked_fetch(tickers, fetch_one, label, chunk_size, max_workers,
-                       per_timeout, sleep_between=0.5, show_progress=True):
-    """
-    Generic chunked parallel fetch helper.
-    `fetch_one(t)` must return (ticker, dict).
-    """
-    out = {}
-    if not tickers:
-        return out
-    chunks = [tickers[i:i+chunk_size] for i in range(0, len(tickers), chunk_size)]
-    status = st.empty()
-    prog = st.progress(0) if show_progress else None
-    for ci, chunk in enumerate(chunks):
-        status.text("{}: {}/{} ({} done)...".format(
-            label, ci + 1, len(chunks), ci * chunk_size))
-        with concurrent.futures.ThreadPoolExecutor(max_workers=max_workers) as ex:
-            futs = {ex.submit(fetch_one, t): t for t in chunk}
-            # Timeout proportional to concurrent workers, not chunk length.
-            chunk_timeout = per_timeout * max(1, min(len(chunk), max_workers))
-            for fut in concurrent.futures.as_completed(futs, timeout=chunk_timeout):
-                try:
-                    t, d = fut.result()
-                    if d:
-                        out[t] = d
-                except Exception:
-                    pass
-        if prog is not None:
-            prog.progress((ci + 1) / len(chunks))
-        if ci < len(chunks) - 1 and sleep_between > 0:
-            time.sleep(sleep_between + random.uniform(0, 0.5 * sleep_between))
-    status.empty()
-    if prog is not None:
-        prog.empty()
-    return out
-
-
 # ══════════════════════════════════════════════════════════════════════════════
 # FIX-MOM-1/2/4/5/6 — Bulk price download (complete rewrite)
 # ══════════════════════════════════════════════════════════════════════════════
@@ -397,14 +360,26 @@ def fetch_prices_bulk(tickers):
         return tu, None
 
     if missing:
-        fallback = _run_chunked_fetch(
-            missing, _fetch_one, "Per-ticker price fallback",
-            chunk_size=15, max_workers=4, per_timeout=FETCH_TIMEOUT_PER_TICKER,
-            sleep_between=1.0,
-        )
-        for tu, c in fallback.items():
-            if c is not None:
-                prices[tu] = c
+        CHUNK = 30; WKRS = 8
+        chunks = [missing[i:i+CHUNK] for i in range(0, len(missing), CHUNK)]
+        prog   = st.progress(0)
+        for ci, chunk in enumerate(chunks):
+            status.text("Per-ticker fallback: {}/{} ({} done)...".format(
+                ci + 1, len(chunks), ci * CHUNK))
+            with concurrent.futures.ThreadPoolExecutor(max_workers=WKRS) as ex:
+                futs = {ex.submit(_fetch_one, t): t for t in chunk}
+                for fut in concurrent.futures.as_completed(
+                        futs, timeout=FETCH_TIMEOUT_PER_TICKER * len(chunk)):
+                    try:
+                        tu, c = fut.result()
+                        if c is not None:
+                            prices[tu] = c
+                    except Exception:
+                        pass
+            prog.progress((ci + 1) / len(chunks))
+            if ci < len(chunks) - 1:
+                time.sleep(1.0 + random.uniform(0, 0.5))
+        prog.empty()
 
     status.empty()
     return prices
@@ -577,8 +552,9 @@ def fetch_fmp_bulk_quotes(tickers, api_key):
 
 @st.cache_data(ttl=86400)
 def fetch_fmp_bulk_key_metrics(tickers, api_key):
-    if not api_key: return {}
-    sess = make_session()
+    out = {}
+    if not api_key: return out
+    tl = list(tickers); sess = make_session()
 
     def fetch_one(t):
         url = ("https://financialmodelingprep.com/api/v3/key-metrics-ttm/"
@@ -632,16 +608,31 @@ def fetch_fmp_bulk_key_metrics(tickers, api_key):
                 time.sleep(1.0)
         return t, {}
 
-    return _run_chunked_fetch(
-        list(tickers), fetch_one, "FMP key-metrics",
-        chunk_size=30, max_workers=8, per_timeout=20, sleep_between=0.5,
-    )
+    CHUNK = 50; WKRS = 15
+    chunks = [tl[i:i+CHUNK] for i in range(0, len(tl), CHUNK)]
+    prog = st.progress(0); status = st.empty()
+    for ci, chunk in enumerate(chunks):
+        status.text("FMP key-metrics: {}/{} ({} done)...".format(
+            ci + 1, len(chunks), ci * CHUNK))
+        with concurrent.futures.ThreadPoolExecutor(max_workers=WKRS) as ex:
+            futs = {ex.submit(fetch_one, t): t for t in chunk}
+            for fut in concurrent.futures.as_completed(futs, timeout=60):
+                try:
+                    t, d = fut.result()
+                    if d: out[t] = d
+                except Exception:
+                    pass
+        prog.progress((ci + 1) / len(chunks))
+        time.sleep(0.5)
+    prog.empty(); status.empty()
+    return out
 
 
 @st.cache_data(ttl=86400)
 def fetch_fmp_bulk_ratios(tickers, api_key):
-    if not api_key: return {}
-    sess = make_session()
+    out = {}
+    if not api_key: return out
+    tl = list(tickers); sess = make_session()
 
     def fetch_one(t):
         url = ("https://financialmodelingprep.com/api/v3/ratios-ttm/"
@@ -674,16 +665,31 @@ def fetch_fmp_bulk_ratios(tickers, api_key):
         except Exception:
             return t, {}
 
-    return _run_chunked_fetch(
-        list(tickers), fetch_one, "FMP ratios",
-        chunk_size=30, max_workers=8, per_timeout=15, sleep_between=0.5,
-    )
+    CHUNK = 50; WKRS = 15
+    chunks = [tl[i:i+CHUNK] for i in range(0, len(tl), CHUNK)]
+    prog = st.progress(0); status = st.empty()
+    for ci, chunk in enumerate(chunks):
+        status.text("FMP ratios: {}/{} ({} done)...".format(
+            ci + 1, len(chunks), ci * CHUNK))
+        with concurrent.futures.ThreadPoolExecutor(max_workers=WKRS) as ex:
+            futs = {ex.submit(fetch_one, t): t for t in chunk}
+            for fut in concurrent.futures.as_completed(futs, timeout=60):
+                try:
+                    t, d = fut.result()
+                    if d: out[t] = d
+                except Exception:
+                    pass
+        prog.progress((ci + 1) / len(chunks))
+        time.sleep(0.5)
+    prog.empty(); status.empty()
+    return out
 
 
 @st.cache_data(ttl=86400)
 def fetch_fmp_income_statements(tickers, api_key):
-    if not api_key: return {}
-    sess = make_session()
+    out = {}
+    if not api_key: return out
+    tl = list(tickers); sess = make_session()
 
     def fetch_one(t):
         url = ("https://financialmodelingprep.com/api/v3/income-statement/"
@@ -730,16 +736,31 @@ def fetch_fmp_income_statements(tickers, api_key):
         except Exception:
             return t, {}
 
-    return _run_chunked_fetch(
-        list(tickers), fetch_one, "FMP income-stmt",
-        chunk_size=30, max_workers=8, per_timeout=25, sleep_between=0.5,
-    )
+    CHUNK = 50; WKRS = 15
+    chunks = [tl[i:i+CHUNK] for i in range(0, len(tl), CHUNK)]
+    prog = st.progress(0); status = st.empty()
+    for ci, chunk in enumerate(chunks):
+        status.text("FMP income-stmt: {}/{} ({} done)...".format(
+            ci + 1, len(chunks), ci * CHUNK))
+        with concurrent.futures.ThreadPoolExecutor(max_workers=WKRS) as ex:
+            futs = {ex.submit(fetch_one, t): t for t in chunk}
+            for fut in concurrent.futures.as_completed(futs, timeout=90):
+                try:
+                    t, d = fut.result()
+                    if d: out[t] = d
+                except Exception:
+                    pass
+        prog.progress((ci + 1) / len(chunks))
+        time.sleep(0.5)
+    prog.empty(); status.empty()
+    return out
 
 
 @st.cache_data(ttl=86400)
 def fetch_fmp_cashflow_statements(tickers, api_key):
-    if not api_key: return {}
-    sess = make_session()
+    out = {}
+    if not api_key: return out
+    tl = list(tickers); sess = make_session()
 
     def fetch_one(t):
         url = ("https://financialmodelingprep.com/api/v3/cash-flow-statement/"
@@ -766,16 +787,31 @@ def fetch_fmp_cashflow_statements(tickers, api_key):
         except Exception:
             return t, {}
 
-    return _run_chunked_fetch(
-        list(tickers), fetch_one, "FMP cashflow",
-        chunk_size=30, max_workers=8, per_timeout=25, sleep_between=0.5,
-    )
+    CHUNK = 50; WKRS = 15
+    chunks = [tl[i:i+CHUNK] for i in range(0, len(tl), CHUNK)]
+    prog = st.progress(0); status = st.empty()
+    for ci, chunk in enumerate(chunks):
+        status.text("FMP cashflow: {}/{} ({} done)...".format(
+            ci + 1, len(chunks), ci * CHUNK))
+        with concurrent.futures.ThreadPoolExecutor(max_workers=WKRS) as ex:
+            futs = {ex.submit(fetch_one, t): t for t in chunk}
+            for fut in concurrent.futures.as_completed(futs, timeout=90):
+                try:
+                    t, d = fut.result()
+                    if d: out[t] = d
+                except Exception:
+                    pass
+        prog.progress((ci + 1) / len(chunks))
+        time.sleep(0.5)
+    prog.empty(); status.empty()
+    return out
 
 
 @st.cache_data(ttl=86400)
 def fetch_fmp_balance_sheets(tickers, api_key):
-    if not api_key: return {}
-    sess = make_session()
+    out = {}
+    if not api_key: return out
+    tl = list(tickers); sess = make_session()
 
     def fetch_one(t):
         url = ("https://financialmodelingprep.com/api/v3/balance-sheet-statement/"
@@ -815,16 +851,31 @@ def fetch_fmp_balance_sheets(tickers, api_key):
         except Exception:
             return t, {}
 
-    return _run_chunked_fetch(
-        list(tickers), fetch_one, "FMP balance-sheet",
-        chunk_size=30, max_workers=8, per_timeout=25, sleep_between=0.5,
-    )
+    CHUNK = 50; WKRS = 15
+    chunks = [tl[i:i+CHUNK] for i in range(0, len(tl), CHUNK)]
+    prog = st.progress(0); status = st.empty()
+    for ci, chunk in enumerate(chunks):
+        status.text("FMP balance-sheet: {}/{} ({} done)...".format(
+            ci + 1, len(chunks), ci * CHUNK))
+        with concurrent.futures.ThreadPoolExecutor(max_workers=WKRS) as ex:
+            futs = {ex.submit(fetch_one, t): t for t in chunk}
+            for fut in concurrent.futures.as_completed(futs, timeout=90):
+                try:
+                    t, d = fut.result()
+                    if d: out[t] = d
+                except Exception:
+                    pass
+        prog.progress((ci + 1) / len(chunks))
+        time.sleep(0.5)
+    prog.empty(); status.empty()
+    return out
 
 
 @st.cache_data(ttl=86400)
 def fetch_fmp_earnings_surprises(tickers, api_key):
-    if not api_key: return {}
-    sess = make_session()
+    out = {}
+    if not api_key: return out
+    tl = list(tickers); sess = make_session()
 
     def fetch_one(t):
         url = ("https://financialmodelingprep.com/api/v3/earnings-surprises/"
@@ -851,10 +902,24 @@ def fetch_fmp_earnings_surprises(tickers, api_key):
         except Exception:
             return t, {}
 
-    return _run_chunked_fetch(
-        list(tickers), fetch_one, "FMP earnings-surprises",
-        chunk_size=30, max_workers=8, per_timeout=20, sleep_between=0.5,
-    )
+    CHUNK = 50; WKRS = 15
+    chunks = [tl[i:i+CHUNK] for i in range(0, len(tl), CHUNK)]
+    prog = st.progress(0); status = st.empty()
+    for ci, chunk in enumerate(chunks):
+        status.text("FMP earnings-surprises: {}/{} ({} done)...".format(
+            ci + 1, len(chunks), ci * CHUNK))
+        with concurrent.futures.ThreadPoolExecutor(max_workers=WKRS) as ex:
+            futs = {ex.submit(fetch_one, t): t for t in chunk}
+            for fut in concurrent.futures.as_completed(futs, timeout=60):
+                try:
+                    t, d = fut.result()
+                    if d: out[t] = d
+                except Exception:
+                    pass
+        prog.progress((ci + 1) / len(chunks))
+        time.sleep(0.5)
+    prog.empty(); status.empty()
+    return out
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -872,99 +937,67 @@ def _fetch_yahoo_fill_one(t):
         "eps_surprise_avg": None, "eps_beat_rate": None,
         "eps_surprise_trend": None, "revision_momentum": None,
     }
-    obj = yf.Ticker(t)
-
-    # ── Fast path: yfinance's fast_info is much cheaper than .info ────────────
-    try:
-        fi = obj.fast_info
-        px       = sf(getattr(fi, "last_price",       None))
-        mc       = sf(getattr(fi, "market_cap",       None))
-        tr_pe    = sf(getattr(fi, "trailing_pe",      None))
-        fwd_pe   = sf(getattr(fi, "forward_pe",       None))
-        tr_eps   = sf(getattr(fi, "trailing_eps",     None))
-        fwd_eps  = sf(getattr(fi, "forward_eps",      None))
-        div_yield = sf(getattr(fi, "dividend_yield",  None))
-        peg_y    = sf(getattr(fi, "peg_ratio",        None))
-
-        if px and px > 0:   result["price"] = px
-        if mc and mc > 0:   result["mc"]    = mc
-        if tr_pe and 0 < tr_pe <= 10_000:
-            result["pe"] = tr_pe; result["pe_src"] = "Yahoo"
-        elif tr_eps and tr_eps > 0 and px and px > 0:
-            result["pe"] = px / tr_eps; result["pe_src"] = "Yahoo(calc)"
-        if fwd_pe and 0 < fwd_pe <= 10_000:
-            result["fwd_pe"] = fwd_pe
-        elif fwd_eps and fwd_eps > 0 and px and px > 0:
-            result["fwd_pe"] = px / fwd_eps
-        if peg_y and 0 < peg_y <= 500:
-            result["peg"] = peg_y; result["peg_src"] = "Yahoo"
-        if div_yield is not None:
-            result["div_yield"] = (div_yield * 100.0 if div_yield < 1.0
-                                   else div_yield if div_yield <= 100.0 else None)
-        if fwd_eps and tr_eps and abs(tr_eps) > 0.01:
-            et = (fwd_eps - tr_eps) / abs(tr_eps)
-            clipped = max(-1.0, min(1.0, et))
-            if tr_eps < 0 and fwd_eps < 0: clipped = min(clipped, 0.30)
-            result["earn_traj"] = clipped
-    except Exception:
-        pass
-
-    # If fast_info gave us the two fields Yahoo uniquely provides, skip heavy .info
-    if result["fwd_pe"] is not None and result["earn_traj"] is not None:
-        return result
-
-    # ── Fallback to full info only when fast_info is insufficient ─────────────
     for attempt in range(MAX_RETRIES_YAHOO):
         try:
+            obj  = yf.Ticker(t)
             info = obj.info or {}
             if not info:
                 raise ValueError("empty info")
-            px = result["price"] or sf(info.get("currentPrice") or info.get("regularMarketPrice"))
 
-            if result["pe"] is None:
-                t_pe  = sf(info.get("trailingPE"))
-                t_eps = sf(info.get("trailingEps"))
-                if t_pe and 0 < t_pe <= 10_000:
-                    result["pe"] = t_pe; result["pe_src"] = "Yahoo"
-                elif t_eps and t_eps > 0 and px and px > 0:
-                    result["pe"] = px / t_eps; result["pe_src"] = "Yahoo(calc)"
+            px    = sf(info.get("currentPrice") or info.get("regularMarketPrice"))
+            t_pe  = sf(info.get("trailingPE"))
+            t_eps = sf(info.get("trailingEps"))
+            if t_pe and 0 < t_pe <= 10_000:
+                result["pe"] = t_pe; result["pe_src"] = "Yahoo"
+            elif t_eps and t_eps > 0 and px and px > 0:
+                result["pe"] = px / t_eps; result["pe_src"] = "Yahoo(calc)"
 
-            if result["fwd_pe"] is None:
-                f_pe  = sf(info.get("forwardPE"))
-                f_eps = sf(info.get("forwardEps"))
-                if f_pe and 0 < f_pe <= 10_000:
-                    result["fwd_pe"] = f_pe
-                elif f_eps and f_eps > 0 and px and px > 0:
-                    result["fwd_pe"] = px / f_eps
+            f_pe  = sf(info.get("forwardPE"))
+            f_eps = sf(info.get("forwardEps"))
+            if f_pe and 0 < f_pe <= 10_000:
+                result["fwd_pe"] = f_pe
+            elif f_eps and f_eps > 0 and px and px > 0:
+                result["fwd_pe"] = px / f_eps
 
-            if result["peg"] is None:
-                peg_y = sf(info.get("pegRatio"))
-                if peg_y and 0 < peg_y <= 500:
-                    result["peg"] = peg_y; result["peg_src"] = "Yahoo"
+            peg_y = sf(info.get("pegRatio"))
+            if peg_y and 0 < peg_y <= 500:
+                result["peg"] = peg_y; result["peg_src"] = "Yahoo"
 
-            if result["roe"] is None:
-                roe_y = sf(info.get("returnOnEquity"))
-                if roe_y is not None: result["roe"] = roe_y * 100.0
-            if result["op_margin"] is None:
-                om_y = sf(info.get("operatingMargins"))
-                if om_y is not None: result["op_margin"] = om_y * 100.0
-            if result["debt_eq"] is None:
-                de_y = sf(info.get("debtToEquity"))
-                if de_y is not None: result["debt_eq"] = de_y / 100.0
+            roe_y = sf(info.get("returnOnEquity"))
+            if roe_y is not None: result["roe"] = roe_y * 100.0
+            om_y  = sf(info.get("operatingMargins"))
+            if om_y is not None: result["op_margin"] = om_y * 100.0
+            de_y  = sf(info.get("debtToEquity"))
+            if de_y is not None: result["debt_eq"] = de_y / 100.0
 
             eg_y = sf(info.get("earningsGrowth"))
             if eg_y is not None:
                 result["eps_growth"] = eg_y * 100.0
                 result["growth_src"] = "Yahoo-fwd"
 
-            if result["earn_traj"] is None:
-                fwd_eps = sf(info.get("forwardEps"))
-                tr_eps  = sf(info.get("trailingEps"))
-                if fwd_eps and tr_eps and abs(tr_eps) > 0.01:
-                    et = (fwd_eps - tr_eps) / abs(tr_eps)
-                    clipped = max(-1.0, min(1.0, et))
-                    if tr_eps < 0 and fwd_eps < 0: clipped = min(clipped, 0.30)
-                    result["earn_traj"] = clipped
+            if result["eps_growth"] is None:
+                try:
+                    eh = obj.earnings
+                    if eh is not None and not eh.empty:
+                        col = next((c for c in ["Earnings","EPS","Net Income"]
+                                    if c in eh.columns), None)
+                        if col:
+                            ev = eh[col].dropna()
+                            if len(ev) >= 3:
+                                e1, e2 = float(ev.iloc[-3]), float(ev.iloc[-1])
+                                if e1 > 0 and e2 > 0:
+                                    result["eps_growth"] = ((e2/e1)**0.5 - 1)*100.0
+                                    result["growth_src"] = "Yahoo-3yr-CAGR"
+                except Exception:
+                    pass
+
+            fwd_eps = sf(info.get("forwardEps"))
+            tr_eps  = sf(info.get("trailingEps"))
+            if fwd_eps and tr_eps and abs(tr_eps) > 0.01:
+                et = (fwd_eps - tr_eps) / abs(tr_eps)
+                clipped = max(-1.0, min(1.0, et))
+                if tr_eps < 0 and fwd_eps < 0: clipped = min(clipped, 0.30)
+                result["earn_traj"] = clipped
 
             if result["mc"] is None:
                 mc_y = sf(info.get("marketCap"))
@@ -981,11 +1014,47 @@ def _fetch_yahoo_fill_one(t):
                 if 0 < ev_s < 100: result["ev_sales"] = ev_s
             result["ev_raw"] = ev_raw
 
-            if result["div_yield"] is None:
-                dy = sf(info.get("dividendYield"))
-                if dy is not None:
-                    result["div_yield"] = (dy * 100.0 if abs(dy) < 1.0
-                                           else dy if abs(dy) <= 100.0 else None)
+            dy = sf(info.get("dividendYield"))
+            if dy is not None:
+                result["div_yield"] = (dy * 100.0 if abs(dy) < 1.0
+                                       else dy if abs(dy) <= 100.0 else None)
+
+            try:
+                rec = obj.recommendations_summary
+                if rec is not None and not rec.empty and len(rec) >= 2:
+                    latest, prior = rec.iloc[0], rec.iloc[1]
+                    sb_chg   = (float(latest.get("strongBuy",0) or 0) +
+                                float(latest.get("buy",0) or 0) -
+                                float(prior.get("strongBuy",0) or 0) -
+                                float(prior.get("buy",0) or 0))
+                    sell_chg = (float(latest.get("sell",0) or 0) +
+                                float(latest.get("strongSell",0) or 0) -
+                                float(prior.get("sell",0) or 0) -
+                                float(prior.get("strongSell",0) or 0))
+                    total = abs(sb_chg) + abs(sell_chg)
+                    result["revision_momentum"] = (
+                        float(np.clip((sb_chg-sell_chg)/total,-1.0,1.0))
+                        if total > 0 else 0.0)
+            except Exception:
+                pass
+
+            try:
+                eh2 = obj.earnings_history
+                if eh2 is not None and not eh2.empty:
+                    eh2 = eh2.dropna(subset=["epsActual","epsEstimate"]).copy()
+                    if len(eh2) > 0:
+                        eh2["sp"] = ((eh2["epsActual"]-eh2["epsEstimate"])
+                                     / eh2["epsEstimate"].abs()*100.0)
+                        eh2 = eh2.tail(4)
+                        result["eps_surprise_avg"]   = float(eh2["sp"].mean())
+                        result["eps_beat_rate"]      = float((eh2["sp"]>0).mean())
+                        if len(eh2) >= 3:
+                            result["eps_surprise_trend"] = (
+                                1.0 if float(eh2["sp"].tail(2).mean()) >
+                                       float(eh2["sp"].head(2).mean()) else -1.0)
+            except Exception:
+                pass
+
             return result
         except Exception:
             time.sleep(1.5 * (attempt + 1) + random.uniform(0, 1.0))
@@ -994,11 +1063,27 @@ def _fetch_yahoo_fill_one(t):
 
 @st.cache_data(ttl=86400)
 def fetch_yahoo_fills(tickers_needing_fill, _cache_date=None):
-    return _run_chunked_fetch(
-        list(tickers_needing_fill), _fetch_yahoo_fill_one, "Yahoo fill",
-        chunk_size=YAHOO_CHUNK_SIZE, max_workers=YAHOO_INFO_WORKERS,
-        per_timeout=FETCH_TIMEOUT_PER_TICKER, sleep_between=YAHOO_SLEEP_BASE,
-    )
+    tl = list(tickers_needing_fill); out = {}
+    if not tl: return out
+    CHUNK = YAHOO_CHUNK_SIZE; WKRS = YAHOO_INFO_WORKERS
+    chunks = [tl[i:i+CHUNK] for i in range(0, len(tl), CHUNK)]
+    prog = st.progress(0); status = st.empty()
+    for ci, chunk in enumerate(chunks):
+        status.text("Yahoo fill: {}/{} ({}/{} tickers)...".format(
+            ci+1, len(chunks), min((ci+1)*CHUNK, len(tl)), len(tl)))
+        with concurrent.futures.ThreadPoolExecutor(max_workers=WKRS) as ex:
+            futs = {ex.submit(_fetch_yahoo_fill_one, t): t for t in chunk}
+            for fut in concurrent.futures.as_completed(
+                    futs, timeout=FETCH_TIMEOUT_PER_TICKER*len(chunk)):
+                try:
+                    t = futs[fut]; d = fut.result(); out[t] = d
+                except Exception:
+                    out[futs[fut]] = {}
+        prog.progress((ci + 1) / len(chunks))
+        if ci < len(chunks)-1:
+            time.sleep(YAHOO_SLEEP_BASE + random.uniform(0, 1.0))
+    prog.empty(); status.empty()
+    return out
 
 
 @st.cache_data(ttl=86400)
@@ -1085,11 +1170,27 @@ def fetch_yahoo_deep_fills(tickers_needing_deep, _cache_date=None):
                 time.sleep(2.0 * (attempt + 1))
         return r
 
-    return _run_chunked_fetch(
-        list(tickers_needing_deep), fetch_one, "Yahoo deep fill",
-        chunk_size=8, max_workers=YAHOO_DEEP_WORKERS,
-        per_timeout=FETCH_TIMEOUT_PER_TICKER, sleep_between=YAHOO_SLEEP_BASE * 1.5,
-    )
+    CHUNK = 10; WKRS = YAHOO_DEEP_WORKERS
+    tl = list(tickers_needing_deep); out = {}
+    if not tl: return out
+    chunks = [tl[i:i+CHUNK] for i in range(0, len(tl), CHUNK)]
+    prog = st.progress(0); status = st.empty()
+    for ci, chunk in enumerate(chunks):
+        status.text("Yahoo deep fill: {}/{} ({}/{})...".format(
+            ci+1, len(chunks), min((ci+1)*CHUNK, len(tl)), len(tl)))
+        with concurrent.futures.ThreadPoolExecutor(max_workers=WKRS) as ex:
+            futs = {ex.submit(fetch_one, t): t for t in chunk}
+            for fut in concurrent.futures.as_completed(
+                    futs, timeout=FETCH_TIMEOUT_PER_TICKER*len(chunk)):
+                try:
+                    t = futs[fut]; d = fut.result(); out[t] = d
+                except Exception:
+                    out[futs[fut]] = {}
+        prog.progress((ci + 1) / len(chunks))
+        if ci < len(chunks)-1:
+            time.sleep(YAHOO_SLEEP_BASE + random.uniform(0, 1.5))
+    prog.empty(); status.empty()
+    return out
 
 
 # ══════════════════════════════════════════════════════════════════════════════

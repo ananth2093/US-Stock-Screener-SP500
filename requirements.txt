@@ -4,3 +4,5 @@ requests
 pandas
 numpy
 beautifulsoup4
+altair
+pyarrow

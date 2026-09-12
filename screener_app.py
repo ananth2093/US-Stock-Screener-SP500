@@ -15,6 +15,7 @@
 #   FIX-MOM-6  prices_map keys normalised to uppercase to match universe_df
 # ─────────────────────────────────────────────────────────────────────────────
 
+import os
 import uuid
 import streamlit as st
 import pandas as pd
@@ -179,16 +180,25 @@ BS_SHARES_ROWS = [
 
 # ── Credentials ────────────────────────────────────────────────────────────────
 def get_fmp_key():
-    try:
-        k = st.secrets["fmp"]["api_key"]
-        return k if k and k.strip() and k != "YOUR_KEY_HERE" else None
-    except Exception:
-        return None
+    for src in [
+        lambda: os.environ.get("FMP_API_KEY"),
+        lambda: os.environ.get("FMP_KEY"),
+        lambda: st.secrets.get("fmp", {}).get("api_key"),
+    ]:
+        try:
+            k = src()
+            if k and k.strip() and k.strip() != "YOUR_KEY_HERE":
+                return k.strip()
+        except Exception:
+            continue
+    return None
 
 
 # ── HTTP session with retry ────────────────────────────────────────────────────
 def make_session():
     s = requests.Session()
+    # Allow headless / Pi environments with certificate issues to opt out of verification
+    s.verify = os.environ.get("SCREENER_DISABLE_SSL", "").lower() not in ("1", "true", "yes")
     s.headers.update({
         "User-Agent": (
             "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
@@ -1746,7 +1756,7 @@ def compute_rank_by_sector(scr):
 @st.cache_data(ttl=86400)
 def fetch_sp500_constituents():
     url  = "https://en.wikipedia.org/wiki/List_of_S%26P_500_companies"
-    r    = requests.get(url, headers={"User-Agent":"Mozilla/5.0"}, timeout=20)
+    r    = make_session().get(url, timeout=20)
     r.raise_for_status()
     soup = BeautifulSoup(r.text, "html.parser")
     tbl  = soup.find("table", {"id":"constituents"})

@@ -221,5 +221,14 @@ __marimo__/
 # latest_screener.parquet / .csv are intentionally kept so Streamlit Cloud can load them
 data/prediction_archive.parquet
 data/price_history.parquet
-data/evaluation/
+
+# ML evaluation outputs needed by the dashboard
+# (keep only small reports/predictions; ignore large training datasets)
+data/evaluation/*
+!data/evaluation/ml_metrics.json
+!data/evaluation/ml_predictions_*.parquet
+!data/evaluation/ml_portfolio_*.csv
+!data/evaluation/ic_summary.csv
+!data/evaluation/backtest_top20_*.csv
+
 score_history.csv

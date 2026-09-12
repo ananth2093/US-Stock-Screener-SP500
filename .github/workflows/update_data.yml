@@ -43,10 +43,15 @@ jobs:
       - name: Evaluate predictions and train ML models
         run: python evaluate_predictions.py
 
-      - name: Commit latest snapshot
+      - name: Commit latest snapshot and ML reports
         uses: stefanzweifel/git-auto-commit-action@v5
         with:
-          commit_message: "chore: update screener snapshot [skip ci]"
+          commit_message: "chore: update screener snapshot and ML reports [skip ci]"
           file_pattern: |
             data/latest_screener.parquet
             data/latest_screener.csv
+            data/evaluation/ml_metrics.json
+            data/evaluation/ml_predictions_*.parquet
+            data/evaluation/ml_portfolio_*.csv
+            data/evaluation/ic_summary.csv
+            data/evaluation/backtest_top20_*.csv

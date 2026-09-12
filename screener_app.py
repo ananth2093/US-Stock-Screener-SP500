@@ -4,6 +4,7 @@
 Run `python update_data.py` to refresh `data/latest_screener.parquet`.
 """
 
+import json
 from datetime import datetime
 from pathlib import Path
 
@@ -599,6 +600,105 @@ Same five factors scored across **all S&P 500 stocks** instead of within a secto
     st.caption("v19.2: full column glossary added · momentum bulk download · score history persisted to disk.")
 
 # ═══════════════════════════════════════════════════════════════════════════════
+# ML Insights page
+# ═══════════════════════════════════════════════════════════════════════════════
+def _load_ml_metrics():
+    path = DATA_DIR / "evaluation" / "ml_metrics.json"
+    if not path.exists():
+        return {}
+    with open(path, encoding="utf-8") as f:
+        return json.load(f)
+
+
+def _load_ml_predictions(horizon: str):
+    path = DATA_DIR / "evaluation" / f"ml_predictions_{horizon}.parquet"
+    if not path.exists():
+        return pd.DataFrame()
+    return pd.read_parquet(path)
+
+
+def _safe_pct(val):
+    return f"{val:.3f}" if isinstance(val, (int, float)) and not pd.isna(val) else "—"
+
+
+def render_ml_page():
+    st.markdown("### ML Insights")
+    st.caption(
+        "XGBoost models trained on historical snapshots to predict forward returns. "
+        "Results appear automatically once the scheduled workflow has accumulated enough price history."
+    )
+
+    metrics = _load_ml_metrics()
+    if not metrics:
+        st.info(
+            "No ML outputs found yet. The first model(s) will be generated after a few scheduled runs "
+            "have built up a small price-history archive."
+        )
+        return
+
+    horizon = st.selectbox("Prediction horizon", list(metrics.keys()), key="ml_horizon")
+    m = metrics.get(horizon, {})
+
+    c1, c2, c3, c4, c5 = st.columns(5)
+    c1.metric("Model IC", _safe_pct(m.get("test_ic")))
+    c2.metric("Score IC", _safe_pct(m.get("score_ic")))
+    c3.metric("Top-Bottom Q Spread", _safe_pct(m.get("top_bottom_quintile_spread")))
+    c4.metric("Top-20 Active Return", _safe_pct(m.get("top20_mean_active_return")))
+    c5.metric("Active Sharpe", _safe_pct(m.get("top20_active_sharpe")))
+
+    fi = pd.DataFrame(m.get("feature_importance", []))
+    if not fi.empty:
+        st.markdown("#### Top model features")
+        fi = fi.sort_values("importance", ascending=True).tail(15)
+        chart = (
+            alt.Chart(fi)
+            .mark_bar()
+            .encode(
+                x=alt.X("importance:Q", title="Importance"),
+                y=alt.Y("feature:N", sort="-x", title=None),
+                color=alt.value("#3b82f6"),
+            )
+            .properties(height=320)
+        )
+        st.altair_chart(chart, use_container_width=True)
+
+    preds = _load_ml_predictions(horizon)
+    if not preds.empty:
+        latest_date = preds["run_date"].max()
+        latest = (
+            preds[preds["run_date"] == latest_date]
+            .sort_values("predicted_return", ascending=False)
+            .head(20)
+            .copy()
+        )
+        latest["predicted_return"] = pd.to_numeric(latest["predicted_return"], errors="coerce").round(4)
+        latest["actual_return"] = pd.to_numeric(latest["actual_return"], errors="coerce").round(4)
+        if "spy_return" in latest.columns:
+            latest["spy_return"] = pd.to_numeric(latest["spy_return"], errors="coerce").round(4)
+        st.markdown(f"#### Top 20 predicted stocks (latest run: {latest_date})")
+        display_cols = [c for c in ["Ticker", "Sector", "Score", "predicted_return", "actual_return", "spy_return"] if c in latest.columns]
+        st.dataframe(latest[display_cols], use_container_width=True, height=420)
+
+    port_path = DATA_DIR / "evaluation" / f"ml_portfolio_{horizon}.csv"
+    if port_path.exists():
+        port = pd.read_csv(port_path)
+        if not port.empty and {"cum_portfolio", "cum_benchmark", "cum_active"}.issubset(port.columns):
+            st.markdown("#### Cumulative backtest returns")
+            df = port[["run_date", "cum_portfolio", "cum_benchmark", "cum_active"]].melt("run_date")
+            chart = (
+                alt.Chart(df)
+                .mark_line()
+                .encode(
+                    x=alt.X("run_date:T", title="Date"),
+                    y=alt.Y("value:Q", title="Cumulative return (1 = start)"),
+                    color=alt.Color("variable:N", title="Portfolio"),
+                )
+                .properties(height=320)
+            )
+            st.altair_chart(chart, use_container_width=True)
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
 # App entry point
 # ═══════════════════════════════════════════════════════════════════════════════
 st.set_page_config(page_title="S&P 500 Screener v19.1", layout="wide")
@@ -626,7 +726,7 @@ st.markdown("## S&P 500 Fundamental Screener v19.1")
 _sel_col, _refresh_col = st.columns([5, 1])
 with _sel_col:
     _selected_page = st.segmented_control(
-        "View", ["Screener", "Column Reference Guide"],
+        "View", ["Screener", "ML Insights", "Column Reference Guide"],
         default="Screener", label_visibility="collapsed"
     )
 with _refresh_col:
@@ -635,6 +735,10 @@ with _refresh_col:
 
 if _selected_page == "Column Reference Guide":
     render_reference_guide()
+    st.stop()
+
+if _selected_page == "ML Insights":
+    render_ml_page()
     st.stop()
 
 # ── Sidebar filters ──────────────────────────────────────────────────────────

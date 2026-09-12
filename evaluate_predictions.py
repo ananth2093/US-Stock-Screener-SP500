@@ -100,6 +100,11 @@ def compute_forward_returns(archive: pd.DataFrame, prices: pd.DataFrame) -> pd.D
         for ticker, group in prices.groupby("ticker")
     }
 
+    # Pre-initialise return columns so the rest of the pipeline can always find them.
+    for label in HORIZONS:
+        archive[f"ret_{label}"] = np.nan
+        archive[f"spy_ret_{label}"] = np.nan
+
     result_frames = []
     for ticker, group in archive.groupby("Ticker"):
         if ticker not in price_series:
@@ -126,7 +131,8 @@ def compute_forward_returns(archive: pd.DataFrame, prices: pd.DataFrame) -> pd.D
         result_frames.append(group)
 
     if not result_frames:
-        raise RuntimeError("No forward returns could be computed; price history may be empty.")
+        print("Warning: No forward returns could be computed; price history may be empty.")
+        return archive
 
     archive = pd.concat(result_frames, ignore_index=True)
 
@@ -461,6 +467,12 @@ def main():
     out_path = EVAL_DIR / "archive_with_returns.parquet"
     archive.to_parquet(out_path, index=False)
     print(f"Saved: {out_path}")
+
+    total_forward_returns = archive[[f"ret_{h}" for h in HORIZONS]].notna().sum().sum()
+    if total_forward_returns == 0:
+        print("\nNot enough price history for forward returns yet. Skipping IC, backtest, and ML training.")
+        print("The archive will accumulate across scheduled runs; evaluation will start automatically once there are at least two trading days of prices.")
+        return
 
     print("\nInformation Coefficients (mean Spearman rank correlation factor -> future return)")
     ic_df = compute_ic(archive)

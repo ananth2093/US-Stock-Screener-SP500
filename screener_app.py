@@ -299,18 +299,10 @@ def _red_grad(s: pd.Series) -> list:
 
 
 METRIC_DIRECTION = {
-    # Higher is better -> green gradient
-    "Score": "green", "Quality Score": "green", "Conviction Score": "green",
-    "CS Score": "green", "ROIC%": "green", "ROE%": "green",
-    "Int Coverage": "green", "Op Margin%": "green", "FCF Yield%": "green",
-    "Earn Traj": "green", "EPS Beat Rate": "green", "Piotroski F": "green",
-    "52W Pos%": "green", "Rev Growth% (CAGR)": "green",
-    "Skip Mo": "green", "vs MA200": "green", "Rel Str SPY": "green",
-    # Lower is better -> red gradient
+    # Only the three most critical columns are colour-coded
+    "Score":         "green",
+    "Quality Score": "green",
     "Momentum Score": "red",
-    "P/E": "red", "Fwd P/E": "red", "EV/EBITDA": "red", "EV/Sales": "red",
-    "PEG": "red", "Debt/Eq": "red", "Trailing Vol%": "red",
-    "P/E vs Sector Med": "red", "Sloan Ratio": "red",
 }
 
 def _first(*vals):

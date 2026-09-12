@@ -27,6 +27,7 @@ import re
 import warnings
 import concurrent.futures
 from datetime import datetime, date
+from pathlib import Path
 from requests.adapters import HTTPAdapter
 from urllib3.util.retry import Retry
 
@@ -49,6 +50,8 @@ YAHOO_INFO_WORKERS = 5
 YAHOO_CHUNK_SIZE   = 15
 YAHOO_SLEEP_BASE   = 2.5
 MAX_RETRIES_YAHOO  = 3
+
+SCORE_HISTORY_FILE = Path("score_history.csv")
 
 SECTOR_FACTOR_WEIGHTS = {
     "Information Technology": {
@@ -576,7 +579,8 @@ def fetch_fmp_bulk_key_metrics(tickers, api_key):
                 fcf_yld  = _g("freeCashFlowYieldTTM")
                 fcf_ps   = _g("freeCashFlowPerShareTTM")
                 shares   = _g("weightedAverageSharesOutstanding") or _g("sharesOutstanding")
-                roic     = _g("roicTTM"); roe = _g("roeTTM")
+                roic     = _g("roicTTM") or _g("returnOnInvestedCapitalTTM") or _g("returnOnCapitalEmployedTTM") or _g("roceTTM")
+                roe      = _g("roeTTM")
                 pe_ttm   = _g("peRatioTTM"); peg = _g("pegRatioTTM") or _g("priceEarningsToGrowthRatioTTM")
                 int_cov  = _g("interestCoverageTTM")
                 gm       = _g("grossProfitMarginTTM"); om = _g("operatingProfitMarginTTM")
@@ -646,7 +650,10 @@ def fetch_fmp_bulk_ratios(tickers, api_key):
             item   = d[0]
             peg_r  = sf(item.get("priceEarningsGrowthRatioTTM"))
             peg    = peg_r if (peg_r and 0 < peg_r <= 500) else None
-            roic_r = sf(item.get("returnOnInvestedCapitalTTM"))
+            roic_r = (sf(item.get("returnOnInvestedCapitalTTM")) or
+                      sf(item.get("returnOnCapitalEmployedTTM")) or
+                      sf(item.get("roicTTM")) or
+                      sf(item.get("roceTTM")))
             roic   = normalise_pct_fmp(roic_r) if roic_r is not None else None
             roe_r  = sf(item.get("returnOnEquityTTM"))
             roe    = normalise_pct_fmp(roe_r) if roe_r is not None else None
@@ -836,6 +843,18 @@ def fetch_fmp_balance_sheets(tickers, api_key):
             cl_now   = gv(d0, "totalCurrentLiabilities")
             ca_prev  = gv(d4, "totalCurrentAssets")
             cl_prev  = gv(d4, "totalCurrentLiabilities")
+            te_now   = gv(d0, "totalStockholdersEquity",
+                              "totalShareholdersEquity", "stockholdersEquity")
+            te_prev  = gv(d4, "totalStockholdersEquity",
+                              "totalShareholdersEquity", "stockholdersEquity")
+            td_now   = gv(d0, "totalDebt", "shortLongTermDebtTotal",
+                              "longTermDebtAndCapitalLeaseObligation", "longTermDebt")
+            td_prev  = gv(d4, "totalDebt", "shortLongTermDebtTotal",
+                              "longTermDebtAndCapitalLeaseObligation", "longTermDebt")
+            cash_now = gv(d0, "cashAndCashEquivalentsAtCarryingValue",
+                              "cashAndShortTermInvestments", "cashAndEquivalents")
+            cash_prev= gv(d4, "cashAndCashEquivalentsAtCarryingValue",
+                              "cashAndShortTermInvestments", "cashAndEquivalents")
             sh_now   = gv(d0, "commonStock", "sharesOutstanding", "weightedAverageShsOut")
             sh_prev  = gv(d4, "commonStock", "sharesOutstanding", "weightedAverageShsOut")
             return t, {
@@ -845,6 +864,12 @@ def fetch_fmp_balance_sheets(tickers, api_key):
                 "lt_debt_ratio_prev": (ltd_prev / ta_prev) if ltd_prev and ta_prev else None,
                 "current_ratio_now":  (ca_now / cl_now)    if ca_now   and cl_now  else None,
                 "current_ratio_prev": (ca_prev / cl_prev)  if ca_prev  and cl_prev else None,
+                "total_equity_now":   te_now,
+                "total_equity_prev":  te_prev,
+                "total_debt_now":     td_now,
+                "total_debt_prev":    td_prev,
+                "cash_now":           cash_now,
+                "cash_prev":          cash_prev,
                 "shares_now":         sh_now,
                 "shares_prev":        sh_prev,
             }
@@ -1097,6 +1122,7 @@ def fetch_yahoo_deep_fills(tickers_needing_deep, _cache_date=None):
             "lt_debt_ratio_now": None, "lt_debt_ratio_prev": None,
             "current_ratio_now": None, "current_ratio_prev": None,
             "shares_now": None, "shares_prev": None,
+            "total_equity_now": None, "total_debt_now": None, "cash_now": None,
             "ebitda_ttm": None, "rev4": [None]*4,
             "roic": None, "int_coverage": None,
         }
@@ -1155,6 +1181,22 @@ def fetch_yahoo_deep_fills(tickers_needing_deep, _cache_date=None):
                             r["total_assets_now"] = ta_now
                             if len(ta_vals) >= 5:
                                 r["total_assets_prev"] = float(ta_vals.iloc[4])
+                    te_row = _find_row(qbs.index, ["Stockholders Equity","Total Stockholders Equity",
+                                                     "Common Stock Equity","StockholdersEquity"])
+                    td_row = _find_row(qbs.index, ["Total Debt","TotalDebt"])
+                    cash_row = _find_row(qbs.index, ["Cash And Cash Equivalents",
+                                                       "Cash And Short Term Investments",
+                                                       "CashAndCashEquivalents",
+                                                       "CashAndShortTermInvestments"])
+                    if te_row:
+                        te = qbs.loc[te_row].dropna()
+                        if len(te) >= 1: r["total_equity_now"] = float(te.iloc[0])
+                    if td_row:
+                        td = qbs.loc[td_row].dropna()
+                        if len(td) >= 1: r["total_debt_now"] = float(td.iloc[0])
+                    if cash_row:
+                        cash = qbs.loc[cash_row].dropna()
+                        if len(cash) >= 1: r["cash_now"] = float(cash.iloc[0])
                     sh_row = _find_row(qbs.index, BS_SHARES_ROWS)
                     if sh_row:
                         sv = qbs.loc[sh_row].dropna()
@@ -1260,6 +1302,15 @@ def build_master_data(
         sh_n      = _first(fb.get("shares_now"),  yd.get("shares_now"))
         sh_p      = _first(fb.get("shares_prev"), yd.get("shares_prev"))
 
+        te_n      = _first(fb.get("total_equity_now"),  yd.get("total_equity_now"))
+        td_n      = _first(fb.get("total_debt_now"),     yd.get("total_debt_now"))
+        cash_n    = _first(fb.get("cash_now"),           yd.get("cash_now"))
+
+        if roic is None and ni_ttm is not None and te_n is not None and td_n is not None:
+            invested = te_n + td_n - (cash_n or 0)
+            if invested > 0:
+                roic = ni_ttm / invested * 100.0
+
         roa_now = yd.get("roa_ttm"); roa_prev = yd.get("roa_prev")
         if roa_now is None and ta_now and ni_ttm:
             avg_ta = ((ta_now + ta_prev) / 2.0 if ta_prev else ta_now)
@@ -1305,11 +1356,52 @@ def build_master_data(
 
 
 # ══════════════════════════════════════════════════════════════════════════════
-# Score History  (v18 FIX-13)
+# Score History  (v18 FIX-13) — now persisted to disk so Score Delta survives
+# new sessions/reruns.
 # ══════════════════════════════════════════════════════════════════════════════
+def _load_score_history() -> None:
+    if "score_history" in st.session_state:
+        return
+    history = {}
+    if SCORE_HISTORY_FILE.exists():
+        try:
+            df = pd.read_csv(SCORE_HISTORY_FILE)
+            for _, row in df.iterrows():
+                t = str(row.get("Ticker", "")).upper().strip()
+                if not t:
+                    continue
+                entry = {
+                    "ts": row.get("ts", ""),
+                    "run_id": row.get("run_id", ""),
+                    "score": row.get("score"),
+                    "conviction": row.get("conviction"),
+                    "rank": row.get("rank"),
+                    "piotroski_f": row.get("piotroski_f"),
+                    "momentum_score": row.get("momentum_score"),
+                }
+                if all(v is None or (isinstance(v, float) and pd.isna(v)) for v in entry.values() if v not in (None, "", "?")):
+                    continue
+                history.setdefault(t, []).append(entry)
+        except Exception:
+            pass
+    st.session_state["score_history"] = history
+
+
+def _save_score_history() -> None:
+    history = st.session_state.get("score_history", {})
+    rows = []
+    for t, entries in history.items():
+        for e in entries[-10:]:
+            rows.append({"Ticker": t, **e})
+    if rows:
+        try:
+            pd.DataFrame(rows).to_csv(SCORE_HISTORY_FILE, index=False)
+        except Exception:
+            pass
+
+
 def record_score_history(scr: pd.DataFrame) -> None:
-    if "score_history" not in st.session_state:
-        st.session_state["score_history"] = {}
+    _load_score_history()
     current_run = st.session_state.get("run_id", "?")
     ts = datetime.now().strftime("%Y-%m-%d %H:%M")
     for _, row in scr.iterrows():
@@ -1324,6 +1416,7 @@ def record_score_history(scr: pd.DataFrame) -> None:
         })
         st.session_state["score_history"][t] = (
             st.session_state["score_history"][t][-10:])
+    _save_score_history()
 
 
 def get_score_delta(ticker: str, current_score) -> float:
@@ -1822,6 +1915,7 @@ st.markdown("## S&P 500 Fundamental Screener v19.1")
 
 if "run_id" not in st.session_state:
     st.session_state["run_id"] = str(uuid.uuid4())[:8]
+_load_score_history()
 
 page_screener, page_reference = st.tabs(["Screener", "Column Reference Guide"])
 

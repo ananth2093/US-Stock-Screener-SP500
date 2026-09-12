@@ -328,6 +328,12 @@ If trailing EPS is negative and forward EPS is still negative, the positive clip
 - Proximity = 95/100 = 0.95 → clipped to [0, 1] → **0.95**
 
 The four signals are each converted to a 0-100 score and blended with the weights above. A stock with strong recent returns, near its highs, above its moving average, and beating SPY will score near 100.
+
+### Why momentum matters in stock screening
+- **Price follows fundamentals, but with a lag.** Momentum shows which stocks the market is already rewarding before the news is fully reflected.
+- **Avoids value traps.** A cheap stock can stay cheap for years; positive momentum indicates buyers are stepping in.
+- **Risk-adjusted view.** Normalising return by volatility highlights smooth, durable trends rather than erratic spikes.
+- **Best combined with quality and valuation.** High momentum + reasonable valuation + strong fundamentals = a higher-conviction idea.
         """)
 
     with tabs[5]:

@@ -2166,19 +2166,19 @@ st.markdown(
 )
 st.markdown("## S&P 500 Fundamental Screener v19.1")
 
-# Refresh button placed beside the tab area for easy access
-_hdr_col, _refresh_col = st.columns([6, 1])
+if "run_id" not in st.session_state:
+    st.session_state["run_id"] = str(uuid.uuid4())[:8]
+_load_score_history()
+
+# Keep the tabs and the Refresh button on the same horizontal line
+_tab_col, _refresh_col = st.columns([8, 1])
+with _tab_col:
+    page_screener, page_reference = st.tabs(["Screener", "Column Reference Guide"])
 with _refresh_col:
     if st.button("Refresh", key="refresh_main"):
         st.cache_data.clear()
         st.session_state["run_id"] = str(uuid.uuid4())[:8]
         st.rerun()
-
-if "run_id" not in st.session_state:
-    st.session_state["run_id"] = str(uuid.uuid4())[:8]
-_load_score_history()
-
-page_screener, page_reference = st.tabs(["Screener", "Column Reference Guide"])
 
 with page_screener:
     fmp_key = get_fmp_key()

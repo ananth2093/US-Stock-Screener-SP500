@@ -2441,9 +2441,9 @@ if _selected_page == "Screener":
     if not filt.empty:
         m1, m2, m3, m4, m5 = st.columns(5)
         m1.metric("Passing stocks", len(filt))
-        m2.metric("Avg Quality", f"{filt['Quality Score'].mean():.1f}")
-        m3.metric("Avg Momentum", f"{filt['Momentum Score'].mean():.1f}")
-        m4.metric("Avg Score", f"{filt['Score'].mean():.1f}")
+        m2.metric("Avg Quality", f"{filt['Quality Score'].mean():.2f}")
+        m3.metric("Avg Momentum", f"{filt['Momentum Score'].mean():.2f}")
+        m4.metric("Avg Score", f"{filt['Score'].mean():.2f}")
         best_sector = (filt.groupby("Sector")["Score"].mean().idxmax()
                        if "Sector" in filt.columns else "—")
         m5.metric("Best sector", best_sector)

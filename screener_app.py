@@ -53,6 +53,14 @@ MAX_RETRIES_YAHOO  = 3
 
 SCORE_HISTORY_FILE = Path("score_history.csv")
 
+# Lightweight no-op progress widgets for quiet/concurrent fetching
+class _NoOpProgress:
+    def progress(self, value): pass
+    def empty(self): pass
+class _NoOpStatus:
+    def text(self, value): pass
+    def empty(self): pass
+
 SECTOR_FACTOR_WEIGHTS = {
     "Information Technology": {
         "valuation": 0.20, "quality": 0.25, "peg": 0.25,
@@ -110,6 +118,20 @@ QUALITY_THRESHOLDS  = {
     "roic_min":         8.0,
     "int_coverage_min": 3.0,
     "op_margin_min":    5.0,
+}
+# Sector-aware overrides — these reflect typical economic moats for each industry
+SECTOR_QUALITY_THRESHOLDS = {
+    "Information Technology": {"roic_min": 12.0, "int_coverage_min": 5.0, "op_margin_min": 15.0},
+    "Communication Services": {"roic_min":  8.0, "int_coverage_min": 3.0, "op_margin_min": 12.0},
+    "Consumer Discretionary": {"roic_min":  8.0, "int_coverage_min": 3.0, "op_margin_min":  8.0},
+    "Consumer Staples":       {"roic_min":  8.0, "int_coverage_min": 4.0, "op_margin_min":  6.0},
+    "Energy":                 {"roic_min":  6.0, "int_coverage_min": 3.0, "op_margin_min": 10.0},
+    "Financials":             {"roic_min":  8.0, "int_coverage_min": 3.0, "op_margin_min": 15.0},
+    "Health Care":            {"roic_min": 10.0, "int_coverage_min": 5.0, "op_margin_min": 12.0},
+    "Industrials":            {"roic_min":  9.0, "int_coverage_min": 4.0, "op_margin_min":  8.0},
+    "Materials":              {"roic_min":  7.0, "int_coverage_min": 3.0, "op_margin_min":  8.0},
+    "Real Estate":            {"roic_min":  5.0, "int_coverage_min": 2.0, "op_margin_min": 25.0},
+    "Utilities":              {"roic_min":  4.0, "int_coverage_min": 2.0, "op_margin_min": 12.0},
 }
 OPERATING_CASH_PCT_OF_REV = 0.02
 
@@ -554,7 +576,7 @@ def fetch_fmp_bulk_quotes(tickers, api_key):
 
 
 @st.cache_data(ttl=86400)
-def fetch_fmp_bulk_key_metrics(tickers, api_key):
+def fetch_fmp_bulk_key_metrics(tickers, api_key, quiet=False):
     out = {}
     if not api_key: return out
     tl = list(tickers); sess = make_session()
@@ -614,7 +636,8 @@ def fetch_fmp_bulk_key_metrics(tickers, api_key):
 
     CHUNK = 50; WKRS = 15
     chunks = [tl[i:i+CHUNK] for i in range(0, len(tl), CHUNK)]
-    prog = st.progress(0); status = st.empty()
+    prog = _NoOpProgress() if quiet else st.progress(0)
+    status = _NoOpStatus() if quiet else st.empty()
     for ci, chunk in enumerate(chunks):
         status.text("FMP key-metrics: {}/{} ({} done)...".format(
             ci + 1, len(chunks), ci * CHUNK))
@@ -633,7 +656,7 @@ def fetch_fmp_bulk_key_metrics(tickers, api_key):
 
 
 @st.cache_data(ttl=86400)
-def fetch_fmp_bulk_ratios(tickers, api_key):
+def fetch_fmp_bulk_ratios(tickers, api_key, quiet=False):
     out = {}
     if not api_key: return out
     tl = list(tickers); sess = make_session()
@@ -674,7 +697,8 @@ def fetch_fmp_bulk_ratios(tickers, api_key):
 
     CHUNK = 50; WKRS = 15
     chunks = [tl[i:i+CHUNK] for i in range(0, len(tl), CHUNK)]
-    prog = st.progress(0); status = st.empty()
+    prog = _NoOpProgress() if quiet else st.progress(0)
+    status = _NoOpStatus() if quiet else st.empty()
     for ci, chunk in enumerate(chunks):
         status.text("FMP ratios: {}/{} ({} done)...".format(
             ci + 1, len(chunks), ci * CHUNK))
@@ -693,7 +717,7 @@ def fetch_fmp_bulk_ratios(tickers, api_key):
 
 
 @st.cache_data(ttl=86400)
-def fetch_fmp_income_statements(tickers, api_key):
+def fetch_fmp_income_statements(tickers, api_key, quiet=False):
     out = {}
     if not api_key: return out
     tl = list(tickers); sess = make_session()
@@ -712,11 +736,19 @@ def fetch_fmp_income_statements(tickers, api_key):
             gp_arr   = [sf(d.get("grossProfit"))       for d in data]
             ni_arr   = [sf(d.get("netIncome"))         for d in data]
             ebit_arr = [sf(d.get("operatingIncome"))   for d in data]
+            ibt_arr  = [sf(d.get("incomeBeforeTax"))   for d in data]
+            tax_arr  = [sf(d.get("incomeTaxExpense"))  for d in data]
             int_arr  = [sf(d.get("interestExpense"))   for d in data]
             rev4 = revs[:4][::-1]
             if len(rev4) < 4: rev4 = ([None]*(4-len(rev4))) + rev4
             ni_ttm   = sum(v for v in ni_arr[:4]   if v is not None) or None
             ebit_ttm = sum(v for v in ebit_arr[:4] if v is not None) or None
+            tax_ttm  = sum(v for v in tax_arr[:4]  if v is not None) or None
+            ibt_ttm  = sum(v for v in ibt_arr[:4]  if v is not None) or None
+            tax_rate = None
+            if tax_ttm is not None and ibt_ttm is not None and ibt_ttm != 0:
+                tax_rate = abs(tax_ttm) / abs(ibt_ttm)
+                if not (0 <= tax_rate <= 1): tax_rate = None
             int_ttm  = sum(abs(v) for v in int_arr[:4] if v is not None) or None
             int_cov  = None
             if ebit_ttm and int_ttm and int_ttm > 0 and ebit_ttm > 0:
@@ -736,6 +768,7 @@ def fetch_fmp_income_statements(tickers, api_key):
             if rev_prev > 0 and gp_prev2 > 0: gm_prev = gp_prev2 / rev_prev * 100.0
             return t, {
                 "rev4": rev4, "net_income_ttm": ni_ttm,
+                "ebit_ttm": ebit_ttm, "tax_rate": tax_rate,
                 "gross_margin_now": gm_now, "gross_margin_prev": gm_prev,
                 "int_coverage": int_cov, "eps_growth": eps_growth,
                 "growth_src": "FMP-IS-2yr" if eps_growth is not None else None,
@@ -745,7 +778,8 @@ def fetch_fmp_income_statements(tickers, api_key):
 
     CHUNK = 50; WKRS = 15
     chunks = [tl[i:i+CHUNK] for i in range(0, len(tl), CHUNK)]
-    prog = st.progress(0); status = st.empty()
+    prog = _NoOpProgress() if quiet else st.progress(0)
+    status = _NoOpStatus() if quiet else st.empty()
     for ci, chunk in enumerate(chunks):
         status.text("FMP income-stmt: {}/{} ({} done)...".format(
             ci + 1, len(chunks), ci * CHUNK))
@@ -764,7 +798,7 @@ def fetch_fmp_income_statements(tickers, api_key):
 
 
 @st.cache_data(ttl=86400)
-def fetch_fmp_cashflow_statements(tickers, api_key):
+def fetch_fmp_cashflow_statements(tickers, api_key, quiet=False):
     out = {}
     if not api_key: return out
     tl = list(tickers); sess = make_session()
@@ -796,7 +830,8 @@ def fetch_fmp_cashflow_statements(tickers, api_key):
 
     CHUNK = 50; WKRS = 15
     chunks = [tl[i:i+CHUNK] for i in range(0, len(tl), CHUNK)]
-    prog = st.progress(0); status = st.empty()
+    prog = _NoOpProgress() if quiet else st.progress(0)
+    status = _NoOpStatus() if quiet else st.empty()
     for ci, chunk in enumerate(chunks):
         status.text("FMP cashflow: {}/{} ({} done)...".format(
             ci + 1, len(chunks), ci * CHUNK))
@@ -815,7 +850,7 @@ def fetch_fmp_cashflow_statements(tickers, api_key):
 
 
 @st.cache_data(ttl=86400)
-def fetch_fmp_balance_sheets(tickers, api_key):
+def fetch_fmp_balance_sheets(tickers, api_key, quiet=False):
     out = {}
     if not api_key: return out
     tl = list(tickers); sess = make_session()
@@ -878,7 +913,8 @@ def fetch_fmp_balance_sheets(tickers, api_key):
 
     CHUNK = 50; WKRS = 15
     chunks = [tl[i:i+CHUNK] for i in range(0, len(tl), CHUNK)]
-    prog = st.progress(0); status = st.empty()
+    prog = _NoOpProgress() if quiet else st.progress(0)
+    status = _NoOpStatus() if quiet else st.empty()
     for ci, chunk in enumerate(chunks):
         status.text("FMP balance-sheet: {}/{} ({} done)...".format(
             ci + 1, len(chunks), ci * CHUNK))
@@ -897,7 +933,7 @@ def fetch_fmp_balance_sheets(tickers, api_key):
 
 
 @st.cache_data(ttl=86400)
-def fetch_fmp_earnings_surprises(tickers, api_key):
+def fetch_fmp_earnings_surprises(tickers, api_key, quiet=False):
     out = {}
     if not api_key: return out
     tl = list(tickers); sess = make_session()
@@ -929,7 +965,8 @@ def fetch_fmp_earnings_surprises(tickers, api_key):
 
     CHUNK = 50; WKRS = 15
     chunks = [tl[i:i+CHUNK] for i in range(0, len(tl), CHUNK)]
-    prog = st.progress(0); status = st.empty()
+    prog = _NoOpProgress() if quiet else st.progress(0)
+    status = _NoOpStatus() if quiet else st.empty()
     for ci, chunk in enumerate(chunks):
         status.text("FMP earnings-surprises: {}/{} ({} done)...".format(
             ci + 1, len(chunks), ci * CHUNK))
@@ -1123,7 +1160,7 @@ def fetch_yahoo_deep_fills(tickers_needing_deep, _cache_date=None):
             "current_ratio_now": None, "current_ratio_prev": None,
             "shares_now": None, "shares_prev": None,
             "total_equity_now": None, "total_debt_now": None, "cash_now": None,
-            "ebitda_ttm": None, "rev4": [None]*4,
+            "ebit_ttm": None, "ebitda_ttm": None, "rev4": [None]*4,
             "roic": None, "int_coverage": None,
         }
         for attempt in range(MAX_RETRIES_YAHOO):
@@ -1144,6 +1181,8 @@ def fetch_yahoo_deep_fills(tickers_needing_deep, _cache_date=None):
                                      if len(vals) < 4 else vals)
                     ebit_ttm = _row_sum_ttm(qfin, INCOME_EBIT_ROWS)
                     int_ttm  = abs(_row_sum_ttm(qfin, INCOME_INT_ROWS) or 0)
+                    if ebit_ttm is not None:
+                        r["ebit_ttm"] = ebit_ttm
                     if ebit_ttm and int_ttm > 0 and ebit_ttm > 0:
                         r["int_coverage"] = min(ebit_ttm / int_ttm, 100.0)
                     ni_ttm = _row_sum_ttm(qfin, ["Net Income",
@@ -1241,7 +1280,7 @@ def fetch_yahoo_deep_fills(tickers_needing_deep, _cache_date=None):
 def build_master_data(
     tickers, fmp_quotes, fmp_key_metrics, fmp_ratios,
     fmp_income, fmp_cashflow, fmp_balance, fmp_surprises,
-    yahoo_fills, yahoo_deep_fills,
+    yahoo_fills, yahoo_deep_fills, fmp_key=None,
 ):
     merged = {}
     for t in tickers:
@@ -1306,10 +1345,18 @@ def build_master_data(
         td_n      = _first(fb.get("total_debt_now"),     yd.get("total_debt_now"))
         cash_n    = _first(fb.get("cash_now"),           yd.get("cash_now"))
 
-        if roic is None and ni_ttm is not None and te_n is not None and td_n is not None:
+        # ROIC fallback: NOPAT / Invested Capital when FMP doesn't provide ROIC directly
+        if roic is None and te_n is not None and td_n is not None:
             invested = te_n + td_n - (cash_n or 0)
             if invested > 0:
-                roic = ni_ttm / invested * 100.0
+                ebit_ttm = _first(fi.get("ebit_ttm"), yd.get("ebitda_ttm"))
+                tax_rate = fi.get("tax_rate")
+                if ebit_ttm is not None:
+                    nopat = ebit_ttm * (1 - (tax_rate if tax_rate is not None and 0 <= tax_rate <= 1 else 0.21))
+                    if abs(nopat) > 1e-9:
+                        roic = nopat / invested * 100.0
+                elif ni_ttm is not None:
+                    roic = ni_ttm / invested * 100.0
 
         roa_now = yd.get("roa_ttm"); roa_prev = yd.get("roa_prev")
         if roa_now is None and ta_now and ni_ttm:
@@ -1352,6 +1399,18 @@ def build_master_data(
             "eps_surprise_avg": eps_surp_avg, "eps_beat_rate": eps_beat_rate,
             "eps_surprise_trend": eps_surp_trend, "revision_momentum": rev_mom,
         }
+        # Data-source confidence: how much of the row is driven by primary FMP data
+        fmp_present = sum(1 for d in [fq, fkm, fr, fi, fc, fb, fs] if d)
+        has_yahoo   = bool(yf_) or bool(yd)
+        if fmp_key and fmp_present >= 4:
+            conf = "High"
+        elif fmp_key and fmp_present >= 1:
+            conf = "Medium"
+        elif has_yahoo:
+            conf = "Low"
+        else:
+            conf = "None"
+        merged[t]["_data_confidence"] = conf
     return merged
 
 
@@ -1708,11 +1767,11 @@ def build_screener_table(universe_df, pm_map, merged_map):
             eps_g = fi.get("eps_growth"); g_src = fi.get("growth_src") or ""
             if eps_g is not None:
                 eg = float(eps_g)
-                if eg >= MIN_GROWTH_PCT_FOR_PEG and pd.notna(pe_for_peg):
+                if eg >= MIN_GROWTH_PCT_FOR_PEG and pd.notna(pe_for_peg) and pe_for_peg > 0:
                     peg = float(pe_for_peg) / eg; peg_method = g_src
             if peg is None and pd.notna(earn_traj) and float(earn_traj) > 0:
                 proxy = float(earn_traj) * 100.0
-                if proxy >= MIN_GROWTH_PCT_FOR_PEG and pd.notna(pe_for_peg):
+                if proxy >= MIN_GROWTH_PCT_FOR_PEG and pd.notna(pe_for_peg) and pe_for_peg > 0:
                     peg = float(pe_for_peg) / proxy; peg_method = "EarnTraj-proxy"
         if peg is not None and (peg <= 0 or peg > 500): peg = None
 
@@ -1751,6 +1810,7 @@ def build_screener_table(universe_df, pm_map, merged_map):
         rows.append({
             "Ticker":             t,
             "Sector":             sec,
+            "Data Confidence":    fi.get("_data_confidence", "Low"),
             "Price":              price,
             "Mkt Cap":            mc,
             "P/E":                pe,
@@ -1812,8 +1872,12 @@ def build_screener_table(universe_df, pm_map, merged_map):
         if c in scr.columns: scr[c] = to_num(scr[c])
     scr = compute_rank_by_sector(scr)
     if "Rank" not in scr.columns: scr["Rank"] = pd.NA
-    sector_med_pe = scr.groupby("Sector")["P/E"].transform("median")
-    scr["P/E vs Sector Med"] = (scr["P/E"] / sector_med_pe).round(2)
+    # Sector median only from positive P/Es; ratio only when P/E is positive
+    sector_med_pe = scr[scr["P/E"] > 0].groupby("Sector")["P/E"].transform("median")
+    pe_ratio = scr["P/E"] / scr.groupby("Sector")["P/E"].transform(
+        lambda s: s[s > 0].median() if (s > 0).any() else pd.NA)
+    pe_ratio = pe_ratio.where((scr["P/E"] > 0) & pe_ratio.notna())
+    scr["P/E vs Sector Med"] = pe_ratio.round(2)
     scr = compute_conviction_scores_elite(scr)
     scr = compute_cross_sectional_scores(scr)
     return scr
@@ -1822,19 +1886,25 @@ def build_screener_table(universe_df, pm_map, merged_map):
 # ══════════════════════════════════════════════════════════════════════════════
 # Quality Flag
 # ══════════════════════════════════════════════════════════════════════════════
+def _sector_quality_thresholds(sector):
+    return SECTOR_QUALITY_THRESHOLDS.get(sector, QUALITY_THRESHOLDS)
+
+
 def quality_flag(roic, roe, ic, om, sloan_ratio=None, sector=None):
     EPSILON = 1e-9; flags = []
+    th = _sector_quality_thresholds(sector)
     prof = (roe if sector in ROE_PRIMARY_SECTORS
             else (roic if (roic is not None and not pd.isna(roic)) else roe))
     lbl  = (("ROE" if sector in ROE_PRIMARY_SECTORS
               else ("ROIC" if (roic is not None and not pd.isna(roic)) else "ROE")))
-    if prof is not None and not pd.isna(prof) and float(prof) < QUALITY_THRESHOLDS["roic_min"] - EPSILON:
-        flags.append("{}<8%".format(lbl))
-    if ic is not None and not pd.isna(ic) and float(ic) < QUALITY_THRESHOLDS["int_coverage_min"]:
-        flags.append("IntCov<3x")
+    roic_min = th["roic_min"]
+    if prof is not None and not pd.isna(prof) and float(prof) < roic_min - EPSILON:
+        flags.append("{}<{:.0f}%".format(lbl, roic_min))
+    if ic is not None and not pd.isna(ic) and float(ic) < th["int_coverage_min"]:
+        flags.append("IntCov<{:.0f}x".format(th["int_coverage_min"]))
     if sector not in ROE_PRIMARY_SECTORS:
-        if om is not None and not pd.isna(om) and float(om) < QUALITY_THRESHOLDS["op_margin_min"]:
-            flags.append("Margin<5%")
+        if om is not None and not pd.isna(om) and float(om) < th["op_margin_min"]:
+            flags.append("Margin<{:.0f}%".format(th["op_margin_min"]))
     if sloan_ratio is not None and not pd.isna(sloan_ratio) and float(sloan_ratio) > SLOAN_ACCRUALS_THRESHOLD:
         flags.append("HighAccruals")
     return ", ".join(flags) if flags else "Pass"
@@ -2195,26 +2265,27 @@ if _selected_page == "Screener":
     tickers     = tuple(universe_df["Ticker"].tolist())
     today_date  = date.today()
 
-    st.markdown("### Filters")
+    # Sidebar filters — keeps the main table area clean and wide
     all_sectors = sorted(universe_df["Sector"].dropna().unique().tolist())
-    f1, f2, f3, f4, f5 = st.columns(5)
-    sector_sel = f1.selectbox("Sector", ["All Sectors"] + all_sectors)
-    sort_by    = f2.selectbox("Sort by", [
-        "Sector then Rank", "Score high to low", "Conviction high to low",
-        "CS Score high to low", "MC% of S&P500 high to low",
-        "Price low to high", "Price high to low", "Mkt Cap high to low",
-        "PE low to high", "Fwd PE low to high", "PEG low to high",
-        "Quality Score high", "ROIC high to low", "ROE high to low",
-        "Earn Traj high to low", "Rev Growth high to low",
-        "Momentum Score high", "52W Pos low to high",
-        "P/E vs Sector Med low to high", "Piotroski F high",
-        "FCF Yield high", "EV/EBITDA low", "EPS Beat Rate high",
-        "Revision Mom high", "Score Delta high",
-    ])
-    mc_min_b   = f3.number_input("Min Mkt Cap ($B)", value=0, step=10, min_value=0)
-    pe_max     = f4.number_input("Max P/E", value=9999, step=50, min_value=0)
-    qual_min_f = f5.number_input("Min Quality Score", value=0.0, step=5.0,
-                                  min_value=0.0, max_value=100.0)
+    with st.sidebar:
+        st.markdown("### Filters")
+        sector_sel = st.selectbox("Sector", ["All Sectors"] + all_sectors)
+        sort_by    = st.selectbox("Sort by", [
+            "Sector then Rank", "Score high to low", "Conviction high to low",
+            "CS Score high to low", "MC% of S&P500 high to low",
+            "Price low to high", "Price high to low", "Mkt Cap high to low",
+            "PE low to high", "Fwd PE low to high", "PEG low to high",
+            "Quality Score high", "ROIC high to low", "ROE high to low",
+            "Earn Traj high to low", "Rev Growth high to low",
+            "Momentum Score high", "52W Pos low to high",
+            "P/E vs Sector Med low to high", "Piotroski F high",
+            "FCF Yield high", "EV/EBITDA low", "EPS Beat Rate high",
+            "Revision Mom high", "Score Delta high",
+        ])
+        mc_min_b   = st.number_input("Min Mkt Cap ($B)", value=0, step=10, min_value=0)
+        pe_max     = st.number_input("Max P/E", value=9999, step=50, min_value=0)
+        qual_min_f = st.number_input("Min Quality Score", value=0.0, step=5.0,
+                                      min_value=0.0, max_value=100.0)
 
     with st.spinner("Step 1/7 — Bulk price download ({} tickers)...".format(len(tickers))):
         prices_map = fetch_prices_bulk(tickers)
@@ -2232,20 +2303,32 @@ if _selected_page == "Screener":
     fmp_income = {}; fmp_cashflow = {}; fmp_balance = {}; fmp_surprises = {}
 
     if fmp_key:
-        with st.spinner("Step 3a/7 — FMP /quote bulk..."):
-            fmp_quotes = fetch_fmp_bulk_quotes(tickers, fmp_key)
-        with st.spinner("Step 3b/7 — FMP /key-metrics-ttm..."):
-            fmp_km     = fetch_fmp_bulk_key_metrics(tickers, fmp_key)
-        with st.spinner("Step 3c/7 — FMP /ratios-ttm..."):
-            fmp_ratios = fetch_fmp_bulk_ratios(tickers, fmp_key)
-        with st.spinner("Step 3d/7 — FMP /income-statement quarterly..."):
-            fmp_income = fetch_fmp_income_statements(tickers, fmp_key)
-        with st.spinner("Step 3e/7 — FMP /cash-flow-statement quarterly..."):
-            fmp_cashflow = fetch_fmp_cashflow_statements(tickers, fmp_key)
-        with st.spinner("Step 3f/7 — FMP /balance-sheet quarterly..."):
-            fmp_balance  = fetch_fmp_balance_sheets(tickers, fmp_key)
-        with st.spinner("Step 3g/7 — FMP /earnings-surprises..."):
-            fmp_surprises = fetch_fmp_earnings_surprises(tickers, fmp_key)
+        # Fetch all FMP endpoints in parallel — they are independent and dominate
+        # the load time when run sequentially.
+        with st.spinner("Step 3/7 — Fetching FMP fundamentals (parallel endpoints)..."):
+            endpoint_jobs = {
+                "quotes":    (fetch_fmp_bulk_quotes,        (tickers, fmp_key)),
+                "km":        (fetch_fmp_bulk_key_metrics,   (tickers, fmp_key, True)),
+                "ratios":    (fetch_fmp_bulk_ratios,        (tickers, fmp_key, True)),
+                "income":    (fetch_fmp_income_statements,  (tickers, fmp_key, True)),
+                "cashflow":  (fetch_fmp_cashflow_statements,(tickers, fmp_key, True)),
+                "balance":   (fetch_fmp_balance_sheets,     (tickers, fmp_key, True)),
+                "surprises": (fetch_fmp_earnings_surprises, (tickers, fmp_key, True)),
+            }
+            with concurrent.futures.ThreadPoolExecutor(max_workers=len(endpoint_jobs)) as ex:
+                futs = {name: ex.submit(fn, *args) for name, (fn, args) in endpoint_jobs.items()}
+                for name, fut in concurrent.futures.as_completed(futs, timeout=300):
+                    try:
+                        res = fut.result()
+                    except Exception:
+                        res = {}
+                    if name == "quotes":    fmp_quotes    = res
+                    elif name == "km":      fmp_km        = res
+                    elif name == "ratios":  fmp_ratios    = res
+                    elif name == "income":  fmp_income    = res
+                    elif name == "cashflow":fmp_cashflow  = res
+                    elif name == "balance": fmp_balance   = res
+                    elif name == "surprises": fmp_surprises = res
 
     with st.spinner("Step 4/7 — Yahoo fill (Fwd P/E, Earn Traj)..."):
         yahoo_fills_map = fetch_yahoo_fills(tickers, _cache_date=today_date)
@@ -2267,7 +2350,7 @@ if _selected_page == "Screener":
         merged_map = build_master_data(
             tickers, fmp_quotes, fmp_km, fmp_ratios,
             fmp_income, fmp_cashflow, fmp_balance, fmp_surprises,
-            yahoo_fills_map, yahoo_deep_map,
+            yahoo_fills_map, yahoo_deep_map, fmp_key=fmp_key,
         )
 
     total_t = len(tickers)
@@ -2338,6 +2421,19 @@ if _selected_page == "Screener":
     sc, sa = sort_map.get(sort_by, (["Sector","Rank"],[True,True]))
     filt   = filt.sort_values(sc, ascending=sa, na_position="last")
 
+    # ── Summary cards ──────────────────────────────────────────────────────────
+    if not filt.empty:
+        m1, m2, m3, m4, m5 = st.columns(5)
+        m1.metric("Passing stocks", len(filt))
+        m2.metric("Avg Quality", f"{filt['Quality Score'].mean():.1f}")
+        m3.metric("Avg Momentum", f"{filt['Momentum Score'].mean():.1f}")
+        m4.metric("Avg Score", f"{filt['Score'].mean():.1f}")
+        best_sector = (filt.groupby("Sector")["Score"].mean().idxmax()
+                       if "Sector" in filt.columns else "—")
+        m5.metric("Best sector", best_sector)
+    else:
+        st.warning("No stocks match the current filters.")
+
     st.caption("Showing **{}** of **{}** · Sector: {} · Sort: {}".format(
         len(filt), len(scr), sector_sel, sort_by))
 
@@ -2375,7 +2471,7 @@ if _selected_page == "Screener":
     disp["Rank"] = disp["Rank"].apply(lambda v: int(v) if pd.notna(v) else pd.NA)
 
     COLS = [
-        "Ticker","Sector","Price ($)","Mkt Cap ($B)","MC% of S&P500",
+        "Ticker","Sector","Data Confidence","Price ($)","Mkt Cap ($B)","MC% of S&P500",
         "P/E","P/E vs Sector Med","Fwd P/E",
         "EV/EBITDA","FCF Yield%","EV/Sales","Div Yield%",
         "PEG","PEG Method","Earn Traj",
@@ -2389,7 +2485,26 @@ if _selected_page == "Screener":
         "Rev Growth% (CAGR)",
     ]
     disp_final = disp[[c for c in COLS if c in disp.columns]].copy()
-    st.dataframe(disp_final, use_container_width=True, height=680)
+
+    # ── Top Picks & sector distribution ────────────────────────────────────────
+    if not filt.empty:
+        with st.expander("Top Picks (by Score)", expanded=False):
+            top_cols = ["Ticker","Sector","Score","Conviction Score",
+                        "Quality Score","Momentum Score","P/E","PEG","Earn Traj"]
+            top_cols = [c for c in top_cols if c in disp.columns]
+            st.dataframe(disp[top_cols].head(10), use_container_width=True, height=350)
+
+        with st.expander("Sector distribution", expanded=False):
+            st.bar_chart(filt["Sector"].value_counts().sort_values(ascending=False))
+
+    # ── Color-coded main table ─────────────────────────────────────────────────
+    style_cols = [c for c in ["Score","Quality Score","Momentum Score",
+                              "Conviction Score","CS Score"] if c in disp_final.columns]
+    if style_cols:
+        styled = disp_final.style.background_gradient(subset=style_cols, cmap="RdYlGn")
+    else:
+        styled = disp_final
+    st.dataframe(styled, use_container_width=True, height=680)
 
     st.download_button(
         label="Download CSV",

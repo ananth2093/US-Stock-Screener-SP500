@@ -1,0 +1,40 @@
+name: Update screener snapshot
+
+on:
+  schedule:
+    # Every 4 hours — the script decides whether to do a full 1-hour market update
+    # or a light refresh based on market-open status.
+    - cron: '0 */4 * * *'
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  update:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repo
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+          cache: 'pip'
+
+      - name: Install dependencies
+        run: pip install -r requirements.txt
+
+      - name: Build screener snapshot
+        env:
+          FMP_API_KEY: ${{ secrets.FMP_API_KEY }}
+        run: python update_data.py
+
+      - name: Commit latest snapshot
+        uses: stefanzweifel/git-auto-commit-action@v5
+        with:
+          commit_message: "chore: update screener snapshot [skip ci]"
+          file_pattern: |
+            data/latest_screener.parquet
+            data/latest_screener.csv

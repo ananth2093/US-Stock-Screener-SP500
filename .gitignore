@@ -216,3 +216,10 @@ __marimo__/
 
 # Streamlit
 .streamlit/secrets.toml
+
+# Screener generated artifacts that grow over time (do not commit these)
+# latest_screener.parquet / .csv are intentionally kept so Streamlit Cloud can load them
+data/prediction_archive.parquet
+data/price_history.parquet
+data/evaluation/
+score_history.csv

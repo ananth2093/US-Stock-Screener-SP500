@@ -2170,10 +2170,16 @@ if "run_id" not in st.session_state:
     st.session_state["run_id"] = str(uuid.uuid4())[:8]
 _load_score_history()
 
-# Keep the tabs and the Refresh button on the same horizontal line
-_tab_col, _refresh_col = st.columns([8, 1])
+# Keep the tabs and the Refresh button on the same horizontal line and close together
+_tab_col, _refresh_col = st.columns([10, 0.8])
 with _tab_col:
     page_screener, page_reference = st.tabs(["Screener", "Column Reference Guide"])
+    # Push the tab labels to the right so they sit next to the Refresh button
+    st.markdown(
+        "<style>div[data-testid='stTabs']:first-of-type div[role='tablist'] "
+        "{ justify-content: flex-end !important; }</style>",
+        unsafe_allow_html=True,
+    )
 with _refresh_col:
     if st.button("Refresh", key="refresh_main"):
         st.cache_data.clear()

@@ -2456,7 +2456,7 @@ if _selected_page == "Screener":
     disp = filt.copy()
     disp["Price ($)"]          = safe_round(disp["Price"], 2)
     disp["Mkt Cap ($B)"]       = safe_round(disp["Mkt Cap"] / 1e9, 2)
-    disp["MC% of S&P500"]      = safe_round(disp["MC% of S&P500"], 4)
+    disp["MC% of S&P500"]      = safe_round(disp["MC% of S&P500"], 2)
     disp["Rev Q1 Oldest ($B)"] = safe_round(disp["Rev Q1 Oldest ($B)"] / 1e9, 2)
     disp["Rev Q2 ($B)"]        = safe_round(disp["Rev Q2 ($B)"]         / 1e9, 2)
     disp["Rev Q3 ($B)"]        = safe_round(disp["Rev Q3 ($B)"]         / 1e9, 2)
@@ -2516,10 +2516,14 @@ if _selected_page == "Screener":
     # ── Color-coded main table (matplotlib-free) ───────────────────────────────
     style_cols = [c for c in ["Score","Quality Score","Momentum Score",
                               "Conviction Score","CS Score"] if c in disp_final.columns]
+    fmt_cols = [c for c in disp_final.columns
+                if c not in ("Ticker","Sector","Data Confidence","Quality Flag","PEG Method")]
     if style_cols:
-        styled = disp_final.style.map(_score_color, subset=style_cols)
+        styled = (disp_final
+                  .style.map(_score_color, subset=style_cols)
+                  .format("{:.2f}", subset=fmt_cols, na_rep=""))
     else:
-        styled = disp_final
+        styled = disp_final.style.format("{:.2f}", subset=fmt_cols, na_rep="")
     st.dataframe(styled, use_container_width=True, height=680)
 
     st.download_button(

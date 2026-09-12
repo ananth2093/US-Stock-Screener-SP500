@@ -266,6 +266,22 @@ def revenue_growth_pct_cagr(rev4):
 def safe_round(series: pd.Series, decimals=2) -> pd.Series:
     return pd.to_numeric(series, errors="coerce").round(decimals)
 
+def _score_color(val):
+    """Return a red->green CSS background colour for a 0-100 score.
+    Does not require matplotlib."""
+    try:
+        v = float(val)
+    except Exception:
+        return ""
+    if pd.isna(v):
+        return ""
+    v = max(0.0, min(100.0, v))
+    ratio = v / 100.0
+    r = int(255 * (1 - ratio))
+    g = int(200 * ratio + 55)  # keep green legible across the range
+    b = 60
+    return f"background-color: rgb({r},{g},{b}); color: white;"
+
 def _first(*vals):
     for v in vals:
         if v is not None and not (isinstance(v, float) and pd.isna(v)):
@@ -2497,11 +2513,11 @@ if _selected_page == "Screener":
         with st.expander("Sector distribution", expanded=False):
             st.bar_chart(filt["Sector"].value_counts().sort_values(ascending=False))
 
-    # ── Color-coded main table ─────────────────────────────────────────────────
+    # ── Color-coded main table (matplotlib-free) ───────────────────────────────
     style_cols = [c for c in ["Score","Quality Score","Momentum Score",
                               "Conviction Score","CS Score"] if c in disp_final.columns]
     if style_cols:
-        styled = disp_final.style.background_gradient(subset=style_cols, cmap="RdYlGn")
+        styled = disp_final.style.map(_score_color, subset=style_cols)
     else:
         styled = disp_final
     st.dataframe(styled, use_container_width=True, height=680)

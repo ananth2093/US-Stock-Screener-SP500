@@ -26,6 +26,7 @@ import random
 import re
 import warnings
 import concurrent.futures
+import altair as alt
 from datetime import datetime, date
 from pathlib import Path
 from requests.adapters import HTTPAdapter
@@ -1919,6 +1920,9 @@ def build_screener_table(universe_df, pm_map, merged_map):
     scr["P/E vs Sector Med"] = pe_ratio.round(2)
     scr = compute_conviction_scores_elite(scr)
     scr = compute_cross_sectional_scores(scr)
+    # Overall Score: blend sector Score, cross-sectional CS Score and Conviction
+    overall_inputs = scr[["Score","CS Score","Conviction Score"]].apply(pd.to_numeric, errors="coerce")
+    scr["Overall Score"] = overall_inputs.mean(axis=1, skipna=True)
     return scr
 
 
@@ -2310,8 +2314,8 @@ if _selected_page == "Screener":
         st.markdown("### Filters")
         sector_sel = st.selectbox("Sector", ["All Sectors"] + all_sectors)
         sort_by    = st.selectbox("Sort by", [
-            "Sector then Rank", "Score high to low", "Conviction high to low",
-            "CS Score high to low", "MC% of S&P500 high to low",
+            "Sector then Rank", "Overall Score high to low", "Score high to low",
+            "Conviction high to low", "CS Score high to low", "MC% of S&P500 high to low",
             "Price low to high", "Price high to low", "Mkt Cap high to low",
             "PE low to high", "Fwd PE low to high", "PEG low to high",
             "Quality Score high", "ROIC high to low", "ROE high to low",
@@ -2432,6 +2436,7 @@ if _selected_page == "Screener":
 
     sort_map = {
         "Sector then Rank":              (["Sector","Rank"],          [True,True]),
+        "Overall Score high to low":     (["Overall Score"],          [False]),
         "Score high to low":             (["Score"],                  [False]),
         "Conviction high to low":        (["Conviction Score"],       [False]),
         "CS Score high to low":          (["CS Score"],               [False]),
@@ -2496,7 +2501,7 @@ if _selected_page == "Screener":
     ROUND_COLS = [
         "P/E","Fwd P/E","PEG","Earn Traj","52W Pos%",
         "ROIC%","ROE%","Int Coverage","Op Margin%","Debt/Eq",
-        "Quality Score","Momentum Score","Ret 1Mo%","Ret 3Mo%",
+        "Quality Score","Momentum Score","Overall Score","Ret 1Mo%","Ret 3Mo%",
         "Ret 6Mo%","Trailing Vol%","Score","Conviction Score","CS Score",
         "Rev Growth% (CAGR)","P/E vs Sector Med",
         "EV/EBITDA","FCF Yield%","EV/Sales","Div Yield%","Sloan Ratio",
@@ -2510,8 +2515,8 @@ if _selected_page == "Screener":
     disp["Rank"] = disp["Rank"].apply(lambda v: int(v) if pd.notna(v) else pd.NA)
 
     COLS = [
-        "Ticker","Sector","Data Confidence","Price ($)","Mkt Cap ($B)","MC% of S&P500",
-        "P/E","P/E vs Sector Med","Fwd P/E",
+        "Ticker","Sector","Price ($)","Mkt Cap ($B)","MC% of S&P500",
+        "Overall Score","P/E","P/E vs Sector Med","Fwd P/E",
         "EV/EBITDA","FCF Yield%","EV/Sales","Div Yield%",
         "PEG","PEG Method","Earn Traj",
         "EPS Surp Avg%","EPS Beat Rate","EPS Surp Trend","Revision Mom",
@@ -2525,20 +2530,47 @@ if _selected_page == "Screener":
     ]
     disp_final = disp[[c for c in COLS if c in disp.columns]].copy()
 
-    # ── Top Picks & sector distribution ────────────────────────────────────────
-    if not filt.empty:
-        with st.expander("Top Picks (by Score)", expanded=False):
-            top_cols = ["Ticker","Sector","Score","Conviction Score",
-                        "Quality Score","Momentum Score","P/E","PEG","Earn Traj"]
-            top_cols = [c for c in top_cols if c in disp.columns]
-            st.dataframe(disp[top_cols].head(10), use_container_width=True, height=350)
+    # ── Top 10 overall picks ───────────────────────────────────────────────────
+    if not scr.empty:
+        with st.expander("Top 10 overall (across all sectors)", expanded=False):
+            top10 = scr.nlargest(10, "Overall Score").copy()
+            top10_cols = ["Ticker","Sector","Overall Score","Score","CS Score",
+                          "Conviction Score","Quality Score","Momentum Score",
+                          "P/E","PEG","Earn Traj"]
+            top10_cols = [c for c in top10_cols if c in top10.columns]
+            for c in top10_cols:
+                if c not in ("Ticker","Sector"):
+                    top10[c] = safe_round(top10[c], 2)
+            st.dataframe(top10[top10_cols], use_container_width=True, height=380)
 
+    # ── Sector distribution ────────────────────────────────────────────────────
+    if not filt.empty:
         with st.expander("Sector distribution", expanded=False):
-            st.bar_chart(filt["Sector"].value_counts().sort_values(ascending=False))
+            sector_df = (filt.groupby("Sector")
+                              .agg(Count=("Ticker","count"),
+                                   MC_Sum=("Mkt Cap","sum"))
+                              .reset_index())
+            total_mc = filt["Mkt Cap"].sum()
+            sector_df["MC%"] = (sector_df["MC_Sum"] / total_mc * 100.0).round(2)
+            sector_df = sector_df.sort_values("Count", ascending=False)
+
+            x_sort = alt.EncodingSortField(field="Count", op="sum", order="descending")
+            bar = (alt.Chart(sector_df)
+                      .mark_bar(color="#93c5fd")
+                      .encode(x=alt.X("Sector:N", sort=x_sort),
+                              y=alt.Y("Count:Q", title="Number of stocks")))
+            line = (alt.Chart(sector_df)
+                       .mark_line(color="#f87171", point=True)
+                       .encode(x=alt.X("Sector:N", sort=x_sort),
+                               y=alt.Y("MC%:Q", title="% of total market cap")))
+            chart = (alt.layer(bar, line)
+                          .resolve_scale(y="independent")
+                          .properties(height=320))
+            st.altair_chart(chart, use_container_width=True)
 
     # ── Color-coded main table (matplotlib-free, pastel gradients) ─────────────
     fmt_cols = [c for c in disp_final.columns
-                if c not in ("Ticker","Sector","Data Confidence","Quality Flag","PEG Method")]
+                if c not in ("Ticker","Sector","Quality Flag","PEG Method")]
     styled = disp_final.style.format("{:.2f}", subset=fmt_cols, na_rep="")
 
     green_cols = [c for c in disp_final.columns if METRIC_DIRECTION.get(c) == "green"]

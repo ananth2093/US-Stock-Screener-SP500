@@ -2049,47 +2049,66 @@ A high positive Revision Mom means analysts are upgrading the stock recently.
 
     # ── Ranking & Score ─────────────────────────────────────────────────────────
     with tabs[6]:
-        st.markdown("""
+        sector_rows = "\n".join(
+            "| {} | {:.0%} | {:.0%} | {:.0%} | {:.0%} | {:.0%} |".format(
+                sector, w["valuation"], w["quality"], w["peg"], w["earn_traj"], w["momentum"]
+            )
+            for sector, w in SECTOR_FACTOR_WEIGHTS.items()
+        )
+        default_row = "| **Default** | {:.0%} | {:.0%} | {:.0%} | {:.0%} | {:.0%} |".format(
+            DEFAULT_FACTOR_WEIGHTS["valuation"], DEFAULT_FACTOR_WEIGHTS["quality"],
+            DEFAULT_FACTOR_WEIGHTS["peg"], DEFAULT_FACTOR_WEIGHTS["earn_traj"],
+            DEFAULT_FACTOR_WEIGHTS["momentum"]
+        )
+        st.markdown(f"""
 ### Ranking & score columns
 
 | Column | Definition | How it is computed |
 |---|---|---|
 | **Score** | Sector-relative composite score | Blend of Valuation, Quality, PEG, Earn Traj, and Momentum within each sector |
 | **Rank** | Rank within sector | Position after sorting by Score descending |
-| **Conviction Score** | Adjusted confidence in the Score | Score × completeness × signal agreement × anomaly penalty, then rescaled 0-100 |
+| **Conviction Score** | Adjusted confidence in the Score | Score x completeness x signal agreement x anomaly penalty, then rescaled 0-100 |
 | **CS Score** | Cross-sectional score | Same five factors, but scored across **all** S&P 500 stocks instead of within a sector |
 | **Score Delta** | Change in Score since the previous run | `Current Score - Previous Score` from saved history |
-| **MC% of S&P500** | Market-cap weight | `Stock Market Cap / Total S&P 500 Market Cap × 100` |
+| **MC% of S&P500** | Market-cap weight | `Stock Market Cap / Total S&P 500 Market Cap x 100` |
 
 ### How the main **Score** is built (per sector)
-Each sector has its own factor weights. Example for Information Technology:
+Each sector has its own factor weights because some factors are more predictive than others for that industry.
+
+#### Sector-specific weights
+| Sector | Valuation | Quality | PEG | Earn Traj | Momentum |
+|---|---|---|---|---|---|
+{sector_rows}
+{default_row}
+
+#### Example — Information Technology
 ```
-Score = 0.20 × Valuation + 0.25 × Quality + 0.25 × PEG + 0.15 × Earn Traj + 0.15 × Momentum
+Score = 0.20 x Valuation + 0.25 x Quality + 0.25 x PEG + 0.15 x Earn Traj + 0.15 x Momentum
 ```
 
 All five sub-scores are already 0-100. The composite is then penalised for missing data:
-- 1 missing factor → ×0.95
-- 2 missing factors → ×0.85
-- 3+ missing factors → ×0.70
+- 1 missing factor -> x0.95
+- 2 missing factors -> x0.85
+- 3+ missing factors -> x0.70
 
 ### Conviction Score adjustment
 The raw Score is adjusted to reflect how **complete and consistent** the signals are:
 
 1. **Completeness multiplier** — more data, higher multiplier
-   - `0.5 + 0.5 × (available factors / 6)`
+   - `0.5 + 0.5 x (available factors / 6)`
 2. **Signal agreement** — do P/E, momentum, and earnings trajectory agree?
-   - High agreement → multiplier up to 1.0
-   - Mixed signals → multiplier as low as 0.0
+   - High agreement -> multiplier up to 1.0
+   - Mixed signals -> multiplier as low as 0.0
 3. **Anomaly multiplier** — penalise red flags
-   - Piotroski F ≤ 2 → ×0.70
-   - Sloan Ratio > 0.08 → ×0.85
+   - Piotroski F <= 2 -> x0.70
+   - Sloan Ratio > 0.08 -> x0.85
 
 After multiplying, the result is min-max scaled to **0-100**.
 
 ### Cross-sectional (CS) Score
 The CS Score ignores sectors and compares every stock to the whole S&P 500:
 ```
-CS = 0.25 × Valuation + 0.25 × Quality + 0.20 × PEG + 0.15 × Earn Traj + 0.15 × Momentum
+CS = 0.25 x Valuation + 0.25 x Quality + 0.20 x PEG + 0.15 x Earn Traj + 0.15 x Momentum
 ```
 It is useful for finding the cheapest / highest-quality names across the entire market, regardless of sector.
 

@@ -2166,6 +2166,14 @@ st.markdown(
 )
 st.markdown("## S&P 500 Fundamental Screener v19.1")
 
+# Refresh button placed beside the tab area for easy access
+_hdr_col, _refresh_col = st.columns([6, 1])
+with _refresh_col:
+    if st.button("Refresh", key="refresh_main"):
+        st.cache_data.clear()
+        st.session_state["run_id"] = str(uuid.uuid4())[:8]
+        st.rerun()
+
 if "run_id" not in st.session_state:
     st.session_state["run_id"] = str(uuid.uuid4())[:8]
 _load_score_history()
@@ -2173,27 +2181,7 @@ _load_score_history()
 page_screener, page_reference = st.tabs(["Screener", "Column Reference Guide"])
 
 with page_screener:
-    col_r, col_t = st.columns([1, 6])
-    with col_r:
-        if st.button("Refresh"):
-            st.cache_data.clear()
-            st.session_state["run_id"] = str(uuid.uuid4())[:8]
-            st.rerun()
-    with col_t:
-        st.caption(
-            "Last loaded: {} · v19.1: momentum fixed (bulk group_by=column) · "
-            "FMP-primary · 95%+ momentum target".format(
-                datetime.now().strftime("%I:%M %p"))
-        )
-
     fmp_key = get_fmp_key()
-    if fmp_key:
-        st.success("✅ FMP API key active — full multi-endpoint coverage enabled.")
-    else:
-        st.warning(
-            "⚠️ No FMP key detected. Momentum will still reach 95%+ (bulk download fixed). "
-            "Add `[fmp] api_key` to Streamlit Secrets for P/E 85%+, FCF 94%+, EPS 87%+"
-        )
 
     with st.spinner("Loading S&P 500 universe..."):
         sp500 = fetch_sp500_constituents()
@@ -2232,18 +2220,10 @@ with page_screener:
     if n_prices < len(tickers) * 0.5:
         st.warning("⚠️ Only {}/{} price series fetched. Momentum coverage may be low.".format(
             n_prices, len(tickers)))
-    else:
-        st.caption("✓ Price series: {}/{} tickers loaded.".format(n_prices, len(tickers)))
 
     with st.spinner("Step 2/7 — SPY benchmark + momentum computation..."):
         spy_3mo = fetch_spy_3mo_return()
         pm_data = build_momentum_map(prices_map, spy_3mo=spy_3mo)
-
-    if spy_3mo is not None:
-        st.caption("SPY 3Mo return: {:.1f}%".format(spy_3mo))
-
-    n_momentum = sum(1 for v in pm_data.values() if v.get("momentum_score") is not None)
-    st.caption("Momentum computed: {}/{} tickers.".format(n_momentum, len(tickers)))
 
     fmp_quotes = {}; fmp_km = {}; fmp_ratios = {}
     fmp_income = {}; fmp_cashflow = {}; fmp_balance = {}; fmp_surprises = {}
@@ -2263,8 +2243,6 @@ with page_screener:
             fmp_balance  = fetch_fmp_balance_sheets(tickers, fmp_key)
         with st.spinner("Step 3g/7 — FMP /earnings-surprises..."):
             fmp_surprises = fetch_fmp_earnings_surprises(tickers, fmp_key)
-    else:
-        st.info("Step 3/7 — FMP skipped (no API key). Yahoo-only mode.")
 
     with st.spinner("Step 4/7 — Yahoo fill (Fwd P/E, Earn Traj)..."):
         yahoo_fills_map = fetch_yahoo_fills(tickers, _cache_date=today_date)
@@ -2281,7 +2259,6 @@ with page_screener:
                                                      _cache_date=today_date)
     else:
         yahoo_deep_map = {}
-        st.success("Step 5/7 — FMP FCF coverage complete, no Yahoo deep needed.")
 
     with st.spinner("Step 6/7 — Merging all sources..."):
         merged_map = build_master_data(

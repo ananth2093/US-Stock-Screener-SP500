@@ -1846,58 +1846,292 @@ def quality_flag(roic, roe, ic, om, sloan_ratio=None, sector=None):
 def render_reference_guide():
     st.markdown("## Column Reference Guide")
     tabs = st.tabs([
-        "Valuation","Quality","PEG","Earn Trajectory",
-        "Momentum","Earnings Surprise","Ranking & Score","Coverage v19.1",
+        "Valuation", "Quality", "PEG", "Earn Trajectory",
+        "Momentum", "Earnings Surprise", "Ranking & Score", "Coverage v19.1",
     ])
+
+    # ── Valuation ────────────────────────────────────────────────────────────
     with tabs[0]:
-        st.markdown("**Valuation** — FCF Yield 40% + EV/EBITDA 35% + Fwd P/E 25%")
+        st.markdown("""
+### What the valuation columns mean
+
+| Column | Definition | Calculation / Source |
+|---|---|---|
+| **P/E** | Trailing 12-month price-to-earnings | Market Cap / Net Income TTM. Filled from FMP quote/key-metrics/ratios; Yahoo `.info` fallback. | FMP quote, key-metrics, ratios; Yahoo `.info` |
+| **Fwd P/E** | Forward price-to-earnings | Market Cap / Forward EPS (next fiscal year). | FMP quote; Yahoo `.info` |
+| **EV/EBITDA** | Enterprise value over EBITDA | Enterprise Value / EBITDA TTM. | FMP key-metrics; Yahoo `.info` |
+| **FCF Yield%** | Free cash flow as a % of market cap | FCF TTM / Market Cap × 100. | FMP key-metrics / cash-flow; computed from FCF TTM |
+| **EV/Sales** | Enterprise value over revenue | EV / Total Revenue. | FMP key-metrics; Yahoo `.info` |
+| **Div Yield%** | Dividend yield | Most recent dividend yield. | Yahoo `.info` |
+| **P/E vs Sector Med** | P/E relative to sector median | `P/E / sector_median(P/E)`. 1.0 = exactly median; <1 = cheaper; >1 = pricier. | Computed inside the app |
+
+### How the Valuation **sub-score** (0-100) is built
+Inside each sector ranking, every eligible stock receives a valuation score using **robust percentile scoring** (MAD Z-score) rather than raw numbers, so extreme outliers don't dominate:
+
+1. **FCF Yield%** — higher is better → weight **40%**
+2. **EV/EBITDA** — lower is better → weight **35%**
+3. **P/E** (using Fwd P/E if available, else P/E) — lower is better → weight **25%**
+
+**Example** — Suppose a Communications stock has FCF Yield 9.6%, EV/EBITDA 8.4, Fwd P/E 9.6. The app compares those values to all other Communications stocks, converts each into a 0-100 score, then blends them 40/35/25. A stock cheaper than most peers scores near 100; an expensive one near 0.
+
+### Why robust scoring?
+A single stock with P/E = 500 would wreck a simple average. We winsorise values and use the median absolute deviation (MAD) to keep outliers from distorting the ranking.
+        """)
+
+    # ── Quality ───────────────────────────────────────────────────────────────
     with tabs[1]:
-        st.markdown("**Quality Score (0-100)** — ROIC 25% · IntCov 15% · OpMargin 15% · GrossMargin 20% · Piotroski 15% · Sloan 10%")
+        st.markdown("""
+### Quality columns
+
+| Column | What it measures | How it is computed | Typical "good" |
+|---|---|---|---|
+| **ROIC%** | Return on invested capital | `Net Income TTM / (Equity + Debt - Cash) × 100`; also filled from FMP `roicTTM` / `returnOnCapitalEmployedTTM` | >8% |
+| **ROE%** | Return on equity | Net Income TTM / Shareholders' Equity × 100 | >10% |
+| **Int Coverage** | Ability to pay interest | EBIT TTM / Interest Expense TTM | >3x |
+| **Op Margin%** | Operating profit per dollar of sales | Operating Income / Revenue × 100 | >5% |
+| **Debt/Eq** | Leverage | Total Debt / Shareholders' Equity | <2.0 |
+| **Quality Score** | Composite 0-100 quality score | See weights below | >60 |
+| **Piotroski F** | 9-point fundamental health score | Sum of 9 binary accounting flags (0-9) | ≥5 |
+| **Sloan Ratio** | Accrual / earnings quality check | `(Net Income - Operating Cash Flow) / Average Total Assets` | close to 0; >0.08 flagged |
+| **Quality Flag** | Human-readable failure labels | Labels the specific thresholds a stock missed | "Pass" = all thresholds met |
+
+### Quality Score formula (0-100)
+1. **Profitability** (ROIC, or ROE for Financials) — **25%**<br>
+   `score = log1p(ROIC) / log1p(30) * 100`; negative = 0
+2. **Interest Coverage** — **15%**<br>
+   `score = min(IC/10 * 100, 100)`
+3. **Operating Margin** — **15%** (excluded for Financials)<br>
+   `score = min(OpMargin/40 * 100, 100)`
+4. **Gross Margin** — **20%**<br>
+   `score = min(GM/60 * 100, 100)`; +10% if GM improved vs prior year
+5. **Piotroski F-score** — **15%**<br>
+   `score = F/9 * 100`
+6. **Sloan Ratio** — **10%**<br>
+   Best near 0; penalised as it moves toward +0.08 or beyond
+
+**Example** — A stock with ROIC 15%, IC 5x, Op Margin 12%, GM 45%, Piotroski 7, Sloan 0.02 gets roughly:
+- Profitability: log(16)/log(31) ≈ 76
+- IC: 5/10 = 50
+- Op Margin: 12/40 = 30
+- GM: 45/60 = 75
+- Piotroski: 7/9 = 78
+- Sloan: near 80
+- Weighted total ≈ **65**
+
+### Quality Flag thresholds
+```
+ROIC < 8%        → "ROIC<8%"   (or "ROE<8%" for Financials)
+Interest Coverage < 3 → "IntCov<3x"
+Op Margin < 5%   → "Margin<5%"
+Sloan Ratio > 0.08 → "HighAccruals"
+```
+If none are triggered, the flag is **"Pass"**.
+        """)
+
+    # ── PEG ────────────────────────────────────────────────────────────────────
     with tabs[2]:
         st.markdown("""
-**PEG v19.1 — 3-tier cascade**
-| Tier | Source | Coverage |
+### PEG Ratio (Price/Earnings-to-Growth)
+PEG tells you how much you are paying per unit of earnings growth. Lower is generally better.
+
+```
+PEG = (Forward P/E or Trailing P/E) / EPS Growth %
+```
+
+### 3-tier cascade (v19.1)
+Because PEG is not always directly available, the app tries three sources in order:
+
+| Tier | Source | When it is used |
 |---|---|---|
-| 1 | FMP key-metrics / ratios direct | ~60% |
-| 2 | EPS growth (FMP IS or Yahoo) | ~80% |
-| 3 | Earn Traj proxy | ~90% |
+| 1 | **Direct FMP** (`pegRatioTTM` from key-metrics or ratios) | First choice; most accurate |
+| 2 | **Computed from EPS growth** | If Tier 1 missing but `EPS Growth %` is available from FMP income statement or Yahoo |
+| 3 | **Earn Trajectory proxy** | If no EPS growth, but the stock has a positive `Earn Traj` (forward EPS > trailing EPS) |
+
+PEG is only shown when the growth input is **≥5%** (otherwise a tiny growth number would create a meaningless PEG).
+
+**Example**
+- Fwd P/E = 15.0
+- EPS Growth = 10%
+- **PEG = 15 / 10 = 1.5**
+
+A PEG of 1.5 means you pay 1.5x the earnings growth rate. The "PEG Method" column tells you which tier was used (e.g., "FMP-km", "FMP-IS-2yr", "Yahoo-fwd", "EarnTraj-proxy").
         """)
+
+    # ── Earn Trajectory ────────────────────────────────────────────────────────
     with tabs[3]:
-        st.markdown("**Earn Traj** = (Fwd EPS − Trail EPS) / |Trail EPS|, clipped [-1,+1].")
+        st.markdown("""
+### Earn Traj (Earnings Trajectory)
+Earn Traj measures the **direction and magnitude of expected earnings change** from trailing to forward EPS.
+
+```
+Earn Traj = (Forward EPS - Trailing EPS) / |Trailing EPS|
+Result is clipped to the range [-1, +1]
+```
+
+| Value | Meaning |
+|---|---|
+| +1.0 | Forward EPS is much higher than trailing EPS (strong expected growth) |
+| 0.0 | No expected change |
+| -1.0 | Forward EPS is much lower (expected decline) |
+
+**Why clip?** If a company swung from a tiny loss to a big profit, the raw percentage could be thousands of percent. Capping it at ±1 keeps the metric stable and comparable across all 500 stocks.
+
+**Example**
+- Trailing EPS = $2.00
+- Forward EPS = $2.74
+- Earn Traj = (2.74 - 2.00) / 2.00 = **+0.37**
+
+This company is expected to grow earnings by ~37%.
+
+If trailing EPS is negative and forward EPS is still negative, the positive clip is limited to **+0.30** to avoid rewarding a "less bad" loss too much.
+        """)
+
+    # ── Momentum ───────────────────────────────────────────────────────────────
     with tabs[4]:
         st.markdown("""
-**Momentum v19.1** — computed via `yf.download(group_by='column')` bulk.
+### Momentum columns
 
-| Signal | Weight |
-|---|---|
-| Skip Mo (6Mo−1Mo return / vol) | 40% |
-| 52W Proximity to high | 25% |
-| vs MA200 | 20% |
-| Rel Str vs SPY 3Mo | 15% |
+| Column | Definition | Calculation |
+|---|---|---|
+| **Ret 1Mo%** | 1-month price return | `(Price today / Price 1 month ago - 1) × 100` |
+| **Ret 3Mo%** | 3-month price return | `(Price today / Price 3 months ago - 1) × 100` |
+| **Ret 6Mo%** | 6-month price return | `(Price today / Price 6 months ago - 1) × 100` |
+| **Trailing Vol%** | Annualised volatility | `std(daily returns) × sqrt(252) × 100` |
+| **52W Pos%** | Where price sits in its 52-week range | `(Price - 52W Low) / (52W High - 52W Low) × 100` |
+| **Momentum Score** | Composite 0-100 momentum score | Blend of 4 signals (see below) |
+
+### Momentum Score components
+| Signal | What it measures | Weight |
+|---|---|---|
+| **Skip Mo** | 6-month return minus 1-month return, normalised by volatility | 40% |
+| **52W Proximity** | How close price is to its 52-week high | 25% |
+| **vs MA200** | Price relative to its 200-day moving average (or 50-day if <200 days) | 20% |
+| **Rel Str SPY** | 3-month return vs SPY 3-month return | 15% |
+
+**Example — Skip Month**
+- 6-month return = +20%
+- 1-month return = +5%
+- Trailing vol = 25%
+- Skip Mo raw = (20 - 5) / 25 = 0.6 → clipped to [-1, +1] → **+0.6**
+
+**Example — 52W Proximity**
+- Price = $95, 52W High = $100
+- Proximity = 95/100 = 0.95 → clipped to [0, 1] → **0.95**
+
+The four signals are each converted to a 0-100 score and blended with the weights above. A stock with strong recent returns, near its highs, above its moving average, and beating SPY will score near 100.
         """)
+
+    # ── Earnings Surprise ────────────────────────────────────────────────────────
     with tabs[5]:
-        st.markdown("**EPS Surprise** — FMP /earnings-surprises (primary) + Yahoo fallback. ~86% coverage.")
+        st.markdown("""
+### Earnings surprise columns
+
+| Column | Definition | Calculation |
+|---|---|---|
+| **EPS Surp Avg%** | Average earnings surprise over the last 4 quarters | `mean((Actual EPS - Estimate) / |Estimate| × 100)` |
+| **EPS Beat Rate** | % of recent quarters that beat estimates | `quarters with positive surprise / total quarters` |
+| **EPS Surp Trend** | Direction of surprises | +1 if the last 2 quarters' average surprise is higher than the previous 2; -1 if lower |
+| **Revision Mom** | Analyst estimate revision momentum | Net change in strong buy/buy vs sell/strong-sell ratings between the two latest months, scaled to [-1,+1] |
+
+**Example — EPS Surprise**
+Recent 4 quarters:
+- Q1: Actual $1.10, Estimate $1.00 → +10%
+- Q2: Actual $1.05, Estimate $1.00 → +5%
+- Q3: Actual $0.98, Estimate $1.00 → -2%
+- Q4: Actual $1.12, Estimate $1.00 → +12%
+
+- Avg surprise = (10 + 5 - 2 + 12) / 4 = **6.25%**
+- Beat rate = 3/4 = **0.75**
+- Trend: last 2 avg = (12 - 2)/2 = 5; previous 2 avg = (10 + 5)/2 = 7.5 → **-1** (trending down)
+
+A high positive Revision Mom means analysts are upgrading the stock recently.
+        """)
+
+    # ── Ranking & Score ─────────────────────────────────────────────────────────
     with tabs[6]:
-        st.markdown("**Score Delta** — run_id guarded (v18). Conviction + CS computed cross-sectionally.")
+        st.markdown("""
+### Ranking & score columns
+
+| Column | Definition | How it is computed |
+|---|---|---|
+| **Score** | Sector-relative composite score | Blend of Valuation, Quality, PEG, Earn Traj, and Momentum within each sector |
+| **Rank** | Rank within sector | Position after sorting by Score descending |
+| **Conviction Score** | Adjusted confidence in the Score | Score × completeness × signal agreement × anomaly penalty, then rescaled 0-100 |
+| **CS Score** | Cross-sectional score | Same five factors, but scored across **all** S&P 500 stocks instead of within a sector |
+| **Score Delta** | Change in Score since the previous run | `Current Score - Previous Score` from saved history |
+| **MC% of S&P500** | Market-cap weight | `Stock Market Cap / Total S&P 500 Market Cap × 100` |
+
+### How the main **Score** is built (per sector)
+Each sector has its own factor weights. Example for Information Technology:
+```
+Score = 0.20 × Valuation + 0.25 × Quality + 0.25 × PEG + 0.15 × Earn Traj + 0.15 × Momentum
+```
+
+All five sub-scores are already 0-100. The composite is then penalised for missing data:
+- 1 missing factor → ×0.95
+- 2 missing factors → ×0.85
+- 3+ missing factors → ×0.70
+
+### Conviction Score adjustment
+The raw Score is adjusted to reflect how **complete and consistent** the signals are:
+
+1. **Completeness multiplier** — more data, higher multiplier
+   - `0.5 + 0.5 × (available factors / 6)`
+2. **Signal agreement** — do P/E, momentum, and earnings trajectory agree?
+   - High agreement → multiplier up to 1.0
+   - Mixed signals → multiplier as low as 0.0
+3. **Anomaly multiplier** — penalise red flags
+   - Piotroski F ≤ 2 → ×0.70
+   - Sloan Ratio > 0.08 → ×0.85
+
+After multiplying, the result is min-max scaled to **0-100**.
+
+### Cross-sectional (CS) Score
+The CS Score ignores sectors and compares every stock to the whole S&P 500:
+```
+CS = 0.25 × Valuation + 0.25 × Quality + 0.20 × PEG + 0.15 × Earn Traj + 0.15 × Momentum
+```
+It is useful for finding the cheapest / highest-quality names across the entire market, regardless of sector.
+
+### Score Delta
+Score Delta shows how a stock's Score has changed since the **previous run**. It is persisted to `score_history.csv` so it survives refreshes and new sessions.
+
+**Example**
+- Previous Score: 72.5
+- Current Score: 78.3
+- **Score Delta = +5.8**
+        """)
+
+    # ── Coverage ─────────────────────────────────────────────────────────────────
     with tabs[7]:
         st.markdown("""
-**Expected coverage v19.1**
+### Expected data coverage v19.1
 
-| Metric | v18 actual | v19 actual | v19.1 target |
+| Metric | Primary source | Fallback | Target coverage |
 |---|---|---|---|
-| P/E | 31% | 82% | 85%+ |
-| Fwd P/E | 32% | 86% | 86%+ |
-| EV/EBITDA | 30% | 80% | 82%+ |
-| FCF | 1% | 94% | 94%+ |
-| EPS Surprise | 33% | 86% | 87%+ |
-| **Momentum** | **21%** | **0%** | **95%+** |
+| **P/E** | FMP quote / key-metrics / ratios | Yahoo `.info` | 85%+ |
+| **Fwd P/E** | FMP quote | Yahoo `.info` | 86%+ |
+| **EV/EBITDA** | FMP key-metrics | Yahoo `.info` | 82%+ |
+| **FCF / FCF Yield** | FMP key-metrics / cash-flow | Yahoo quarterly cash-flow | 94%+ |
+| **PEG** | FMP direct | EPS growth, Earn Traj proxy | 90%+ |
+| **EPS Surprise** | FMP earnings-surprises | Yahoo earnings history | 87%+ |
+| **Revision Mom** | Yahoo recommendations summary | — | ~60% |
+| **Momentum** | Yahoo bulk price download (`yf.download`) | Per-ticker fallback | 95%+ |
 
-**Root cause of 0% momentum**: `yf.download(group_by='ticker')` returns
-MultiIndex with outer=ticker, inner=field — but code accessed `raw[t]['Close']`
-which works only when outer=field. Fixed with `group_by='column'` +
-`raw['Close'][t]` pattern plus 3-pattern fallback chain.
+### Data-source priority
+The app uses **FMP as primary** and Yahoo as a fallback. The coverage line at the bottom of the screener shows exactly how many tickers were filled for each metric.
+
+**Why does coverage vary?**
+- Not every company reports all metrics (e.g., some have no dividends).
+- Yahoo rate-limits heavy `.info` calls, so Yahoo-fill coverage can fluctuate.
+- FMP free-tier rate limits can reduce coverage if too many requests are fired too quickly; the app chunks requests and sleeps between chunks to stay under limits.
+
+### Sources key
+- **FMP** = Financial Modeling Prep API
+- **Yahoo** = Yahoo Finance via `yfinance`
         """)
-    st.caption("v19.1: momentum bulk download fixed · cached build_momentum_map · uppercase key normalisation.")
+
+    st.caption("v19.1: momentum bulk download fixed · cached build_momentum_map · uppercase key normalisation · score history persisted to disk.")
 
 
 # ══════════════════════════════════════════════════════════════════════════════

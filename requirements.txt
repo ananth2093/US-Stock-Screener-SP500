@@ -6,3 +6,6 @@ numpy
 beautifulsoup4
 altair
 pyarrow
+scikit-learn
+xgboost
+joblib

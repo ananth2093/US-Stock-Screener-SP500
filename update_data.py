@@ -1,8 +1,8 @@
 # update_data.py
-"""Headless data updater for screener_app.py.
+"""Headless data updater for the screener.
 
-Runs the full screener pipeline with a minimal Streamlit stub, then persists
-`scr` and `prices_map` to the `data/` folder for instant loading by `app.py`.
+Runs the legacy screener pipeline with a minimal Streamlit stub, then persists
+`scr` and `prices_map` to the `data/` folder for instant loading by the dashboard.
 """
 
 import importlib.util
@@ -161,7 +161,7 @@ def _build_streamlit_stub():
 
 # ── Throttle check (Pi scheduler runs us every hour) ─────────────────────────
 SCRIPT_DIR = Path(__file__).parent.resolve()
-SCREENER_PATH = SCRIPT_DIR / "screener_app.py"
+SCREENER_PATH = SCRIPT_DIR / "screener_app_legacy.py"
 
 data_dir = SCRIPT_DIR / "data"
 data_dir.mkdir(exist_ok=True)
@@ -171,7 +171,7 @@ if not _should_update(data_dir):
     raise SystemExit(0)
 
 
-# ── Run screener_app.py headlessly ───────────────────────────────────────────
+# ── Run screener_app_legacy.py headlessly ──────────────────────────────────
 
 sys.modules["streamlit"] = _build_streamlit_stub()
 
@@ -188,7 +188,7 @@ prices_map = getattr(screener_mod, "prices_map", None)
 
 if scr is None or prices_map is None:
     raise RuntimeError(
-        "screener_app.py did not produce `scr` and/or `prices_map`. "
+        "screener_app_legacy.py did not produce `scr` and/or `prices_map`. "
         "Check the headless run output for errors."
     )
 

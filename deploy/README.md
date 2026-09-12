@@ -35,7 +35,7 @@ This folder contains systemd service/timer files to keep the screener running lo
 
 ## What the services do
 
-- `pi-screener-dashboard.service` — runs `streamlit run app.py` on port 8501, starts on boot, and restarts if it crashes.
+- `pi-screener-dashboard.service` — runs `streamlit run screener_app.py` on port 8501, starts on boot, and restarts if it crashes.
 - `pi-screener-updater.service` — runs `python update_data.py` when triggered.
 - `pi-screener-updater.timer` — triggers the updater every hour.
 

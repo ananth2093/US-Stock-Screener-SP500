@@ -2317,9 +2317,9 @@ if _selected_page == "Screener":
             }
             with concurrent.futures.ThreadPoolExecutor(max_workers=len(endpoint_jobs)) as ex:
                 futs = {name: ex.submit(fn, *args) for name, (fn, args) in endpoint_jobs.items()}
-                for name, fut in concurrent.futures.as_completed(futs, timeout=300):
+                for name, fut in futs.items():
                     try:
-                        res = fut.result()
+                        res = fut.result(timeout=300)
                     except Exception:
                         res = {}
                     if name == "quotes":    fmp_quotes    = res

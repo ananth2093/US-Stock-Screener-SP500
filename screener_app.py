@@ -266,21 +266,52 @@ def revenue_growth_pct_cagr(rev4):
 def safe_round(series: pd.Series, decimals=2) -> pd.Series:
     return pd.to_numeric(series, errors="coerce").round(decimals)
 
-def _score_color(val):
-    """Return a red->green CSS background colour for a 0-100 score.
-    Does not require matplotlib."""
-    try:
-        v = float(val)
-    except Exception:
-        return ""
-    if pd.isna(v):
-        return ""
-    v = max(0.0, min(100.0, v))
-    ratio = v / 100.0
-    r = int(255 * (1 - ratio))
-    g = int(200 * ratio + 55)  # keep green legible across the range
-    b = 60
-    return f"background-color: rgb({r},{g},{b}); color: white;"
+def _hex_to_rgb(hex_color: str):
+    hex_color = hex_color.lstrip("#")
+    return tuple(int(hex_color[i:i+2], 16) for i in (0, 2, 4))
+
+
+def _blend_color(ratio: float, low_hex: str, high_hex: str) -> str:
+    low = _hex_to_rgb(low_hex); high = _hex_to_rgb(high_hex)
+    rgb = tuple(int(low[i] + (high[i] - low[i]) * ratio) for i in range(3))
+    return f"background-color: rgb({rgb[0]},{rgb[1]},{rgb[2]}); color: #1f2937;"
+
+
+def _column_gradient(series: pd.Series, low_hex: str, high_hex: str) -> list:
+    """Pastel gradient from low_hex (light) to high_hex (dark) based on the
+    column's own min/max."""
+    s = pd.to_numeric(series, errors="coerce")
+    s_min, s_max = s.min(), s.max()
+    if pd.isna(s_min) or pd.isna(s_max) or s_max == s_min:
+        return [""] * len(s)
+    ratios = ((s - s_min) / (s_max - s_min)).tolist()
+    return [_blend_color(r, low_hex, high_hex) if pd.notna(r) else "" for r in ratios]
+
+
+def _green_grad(s: pd.Series) -> list:
+    # light pastel green -> darker pastel green
+    return _column_gradient(s, "#d4f7d4", "#6bc46b")
+
+
+def _red_grad(s: pd.Series) -> list:
+    # light pastel red -> darker pastel red
+    return _column_gradient(s, "#ffd9d9", "#e07a7a")
+
+
+METRIC_DIRECTION = {
+    # Higher is better -> green gradient
+    "Score": "green", "Quality Score": "green", "Conviction Score": "green",
+    "CS Score": "green", "ROIC%": "green", "ROE%": "green",
+    "Int Coverage": "green", "Op Margin%": "green", "FCF Yield%": "green",
+    "Earn Traj": "green", "EPS Beat Rate": "green", "Piotroski F": "green",
+    "52W Pos%": "green", "Rev Growth% (CAGR)": "green",
+    "Skip Mo": "green", "vs MA200": "green", "Rel Str SPY": "green",
+    # Lower is better -> red gradient
+    "Momentum Score": "red",
+    "P/E": "red", "Fwd P/E": "red", "EV/EBITDA": "red", "EV/Sales": "red",
+    "PEG": "red", "Debt/Eq": "red", "Trailing Vol%": "red",
+    "P/E vs Sector Med": "red", "Sloan Ratio": "red",
+}
 
 def _first(*vals):
     for v in vals:
@@ -2513,17 +2544,17 @@ if _selected_page == "Screener":
         with st.expander("Sector distribution", expanded=False):
             st.bar_chart(filt["Sector"].value_counts().sort_values(ascending=False))
 
-    # ── Color-coded main table (matplotlib-free) ───────────────────────────────
-    style_cols = [c for c in ["Score","Quality Score","Momentum Score",
-                              "Conviction Score","CS Score"] if c in disp_final.columns]
+    # ── Color-coded main table (matplotlib-free, pastel gradients) ─────────────
     fmt_cols = [c for c in disp_final.columns
                 if c not in ("Ticker","Sector","Data Confidence","Quality Flag","PEG Method")]
-    if style_cols:
-        styled = (disp_final
-                  .style.map(_score_color, subset=style_cols)
-                  .format("{:.2f}", subset=fmt_cols, na_rep=""))
-    else:
-        styled = disp_final.style.format("{:.2f}", subset=fmt_cols, na_rep="")
+    styled = disp_final.style.format("{:.2f}", subset=fmt_cols, na_rep="")
+
+    green_cols = [c for c in disp_final.columns if METRIC_DIRECTION.get(c) == "green"]
+    red_cols   = [c for c in disp_final.columns if METRIC_DIRECTION.get(c) == "red"]
+    if green_cols:
+        styled = styled.apply(_green_grad, axis=0, subset=green_cols)
+    if red_cols:
+        styled = styled.apply(_red_grad, axis=0, subset=red_cols)
     st.dataframe(styled, use_container_width=True, height=680)
 
     st.download_button(

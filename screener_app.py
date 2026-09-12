@@ -2170,15 +2170,12 @@ if "run_id" not in st.session_state:
     st.session_state["run_id"] = str(uuid.uuid4())[:8]
 _load_score_history()
 
-# Keep the tabs and the Refresh button on the same horizontal line and close together
-_tab_col, _refresh_col = st.columns([10, 0.8])
-with _tab_col:
-    page_screener, page_reference = st.tabs(["Screener", "Column Reference Guide"])
-    # Push the tab labels to the right so they sit next to the Refresh button
-    st.markdown(
-        "<style>div[data-testid='stTabs']:first-of-type div[role='tablist'] "
-        "{ justify-content: flex-end !important; }</style>",
-        unsafe_allow_html=True,
+# Keep the view selector and the Refresh button on the same horizontal line
+_sel_col, _refresh_col = st.columns([5, 1])
+with _sel_col:
+    _selected_page = st.segmented_control(
+        "View", ["Screener", "Column Reference Guide"],
+        default="Screener", label_visibility="collapsed"
     )
 with _refresh_col:
     if st.button("Refresh", key="refresh_main"):
@@ -2186,7 +2183,7 @@ with _refresh_col:
         st.session_state["run_id"] = str(uuid.uuid4())[:8]
         st.rerun()
 
-with page_screener:
+if _selected_page == "Screener":
     fmp_key = get_fmp_key()
 
     with st.spinner("Loading S&P 500 universe..."):
@@ -2402,5 +2399,5 @@ with page_screener:
         mime="text/csv",
     )
 
-with page_reference:
+if _selected_page == "Column Reference Guide":
     render_reference_guide()

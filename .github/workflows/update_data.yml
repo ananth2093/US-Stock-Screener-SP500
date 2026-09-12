@@ -26,10 +26,22 @@ jobs:
       - name: Install dependencies
         run: pip install -r requirements.txt
 
+      - name: Restore prediction archive cache
+        uses: actions/cache@v4
+        with:
+          path: |
+            data/prediction_archive.parquet
+            data/price_history.parquet
+          key: screener-archive-${{ github.run_id }}
+          restore-keys: screener-archive-
+
       - name: Build screener snapshot
         env:
           FMP_API_KEY: ${{ secrets.FMP_API_KEY }}
         run: python update_data.py
+
+      - name: Evaluate predictions and train ML models
+        run: python evaluate_predictions.py
 
       - name: Commit latest snapshot
         uses: stefanzweifel/git-auto-commit-action@v5

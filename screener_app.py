@@ -166,7 +166,7 @@ def render_reference_guide():
 
     tabs = st.tabs([
         "Overview", "Valuation", "Quality", "PEG", "Earn Trajectory",
-        "Earnings Surprise", "Momentum", "Ranking & Score", "Full Column Glossary", "Data Sources & Coverage",
+        "Earnings Surprise", "Momentum", "Ranking & Score", "Full Column Glossary", "Data Sources & Coverage", "Worked Examples",
     ])
 
     with tabs[0]:
@@ -440,6 +440,160 @@ The app uses **FMP as primary** and Yahoo as a fallback. The coverage banner at 
 - Yahoo rate-limits heavy `.info` calls, so Yahoo-fill coverage can fluctuate.
 - FMP free-tier rate limits can reduce coverage; the app chunks requests and sleeps between chunks.
 - **A blank is not a zero.** It means "data unavailable" and the score is penalised for missing that factor.
+""")
+
+    with tabs[10]:
+        st.markdown("""
+### Worked examples — how the numbers are calculated
+
+#### P/E (Price-to-Earnings)
+**Formula:** `P/E = Stock Price / Trailing 12-Month EPS`
+
+- If **Apple** stock price = **$200** and trailing 12-month EPS = **$8**, then:
+  - P/E = 200 / 8 = **25**
+- A P/E of 25 means investors are paying $25 for every $1 of past-year earnings.
+- Compare to the sector median. If Tech median P/E = 28, then P/E vs Sector Med = 25 / 28 = **0.89** → cheaper than peers.
+
+#### Fwd P/E (Forward P/E)
+**Formula:** `Fwd P/E = Stock Price / Expected Next-12-Month EPS`
+
+- If stock price = $200 and expected EPS = $10, then:
+  - Fwd P/E = 200 / 10 = **20**
+- Lower than trailing P/E suggests expected earnings growth.
+
+#### EV/EBITDA
+**Formula:** `EV/EBITDA = Enterprise Value / EBITDA`
+
+- Market Cap = $1,000B, Debt = $200B, Cash = $50B
+  - Enterprise Value = 1,000 + 200 − 50 = **$1,150B**
+- EBITDA = $115B
+  - EV/EBITDA = 1,150 / 115 = **10.0x**
+- Lower often means cheaper on an enterprise basis.
+
+#### FCF Yield%
+**Formula:** `FCF Yield = Free Cash Flow TTM / Market Cap × 100`
+
+- FCF TTM = $50B, Market Cap = $1,000B
+  - FCF Yield = 50 / 1,000 × 100 = **5%**
+- Higher yield means more cash returned relative to the price.
+
+#### PEG
+**Formula:** `PEG = P/E / Annual EPS Growth %`
+
+- P/E = 25, EPS growth = 15%
+  - PEG = 25 / 15 = **1.67**
+- <1.0 attractive; 1.0–2.0 fair; >2.0 expensive.
+
+#### ROIC%
+**Formula:** `ROIC = Net Operating Profit After Tax / (Equity + Debt − Cash) × 100`
+
+- NOPAT = $20B, Equity = $100B, Debt = $30B, Cash = $10B
+  - Invested Capital = 100 + 30 − 10 = **$120B**
+  - ROIC = 20 / 120 × 100 = **16.7%**
+- >15% excellent; <8% flagged.
+
+#### ROE%
+**Formula:** `ROE = Net Income / Shareholders' Equity × 100`
+
+- Net Income = $15B, Equity = $75B
+  - ROE = 15 / 75 × 100 = **20%**
+- For Financials, ROE is the primary quality metric.
+
+#### Int Coverage
+**Formula:** `Int Coverage = EBIT / Interest Expense`
+
+- EBIT = $30B, Interest Expense = $5B
+  - Int Coverage = 30 / 5 = **6x**
+- >3x safe; <3x flagged.
+
+#### Op Margin%
+**Formula:** `Op Margin = Operating Income / Revenue × 100`
+
+- Operating Income = $40B, Revenue = $200B
+  - Op Margin = 40 / 200 × 100 = **20%**
+- Higher = better pricing power.
+
+#### Piotroski F
+A 9-point score based on profitability, leverage, and efficiency.
+- Positive net income, positive operating cash flow, improving ROA, lower debt, improving current ratio, no new share issuance, higher gross margin, higher asset turnover, etc.
+- **Score ≥ 5** considered healthy.
+
+#### Sloan Ratio
+**Formula:** `Sloan Ratio = (Net Income − Operating Cash Flow) / Average Total Assets`
+
+- Net Income = $10B, Operating Cash Flow = $6B, Average Total Assets = $100B
+  - Sloan Ratio = (10 − 6) / 100 = **0.04**
+- >0.08 → accruals are high, earnings quality may be lower.
+
+#### Earn Traj
+**Formula:** `(Forward EPS − Trailing EPS) / |Trailing EPS|`, clipped to [−1, +1]
+
+- Trailing EPS = $8, Forward EPS = $10
+  - Earn Traj = (10 − 8) / 8 = **+0.25**
+- Positive = expected growth; negative = expected decline.
+
+#### EPS Surp Avg%
+**Formula:** `(Actual EPS − Estimate EPS) / |Estimate EPS| × 100`, averaged over last 4 quarters
+
+- Beat estimates by 2%, 3%, 1%, 4% over 4 quarters
+  - Avg = (2 + 3 + 1 + 4) / 4 = **2.5%**
+
+#### EPS Beat Rate
+- 3 of last 4 quarters beat estimates → **75%**
+
+#### Revision Mom
+- Strong buy/buy ratings increased from 12 to 15 while sell/strong-sell stayed at 2 → positive Revision Mom.
+
+#### Skip Mo (Momentum signal)
+**Formula:** `(6-month return − 1-month return) / Trailing Volatility`
+
+- 6-month return = 18%, 1-month return = 5%, Trailing Vol = 25%
+  - Skip Mo = (18 − 5) / 25 = **0.52**
+
+#### 52W Prox
+**Formula:** `Current Price / 52W High`
+
+- Price = $95, 52W High = $100 → **0.95** (near highs)
+
+#### vs MA200
+**Formula:** `(Current Price − 200-day MA) / 200-day MA`
+
+- Price = $110, MA200 = $100 → **+10%** (above long-term average)
+
+#### Rel Str SPY
+**Formula:** `(Stock 3Mo Return − SPY 3Mo Return)`
+
+- Stock +12%, SPY +8% → **+4%** (outperforming market)
+
+#### Momentum Score
+A 0–100 composite blending Skip Mo (40%), 52W Prox (25%), vs MA200 (20%), Rel Str SPY (15%).
+- Strong scores across all four components → Momentum Score near **100**.
+
+#### Score / Overall Score
+A sector-relative composite 0–100 using sector-adaptive weights for Valuation, Quality, PEG, Earn Traj, and Momentum.
+- A stock scoring 85 is better than 85% of peers in its sector on the combined factors.
+
+#### CS Score
+Same five factors scored across **all S&P 500 stocks** instead of within a sector.
+- Useful for finding the cheapest/highest-quality names market-wide.
+
+#### Score Delta
+**Formula:** `Current Score − Previous Run Score`
+
+- Last run Score = 70, current Score = 78 → **Score Delta = +8**
+- Positive means the stock's ranking improved since the last update.
+
+#### Rev Growth% (CAGR)
+**Formula:** `(Newest Quarter Revenue / Revenue 4 Quarters Ago)^(1/3) − 1 × 100`
+
+- Q4 = $120B, Q1 = $100B
+  - CAGR = (120 / 100)^(1/3) − 1 = **6.3%**
+
+#### MC% of S&P500
+**Formula:** `Stock Market Cap / Total S&P 500 Market Cap × 100`
+
+- Apple market cap = $3,000B, total S&P 500 market cap = $40,000B
+  - MC% = 3,000 / 40,000 × 100 = **7.5%**
 """)
 
     st.caption("v19.2: full column glossary added · momentum bulk download · score history persisted to disk.")

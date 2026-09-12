@@ -2556,12 +2556,14 @@ if _selected_page == "Screener":
 
             x_sort = alt.EncodingSortField(field="Count", op="sum", order="descending")
             bar = (alt.Chart(sector_df)
-                      .mark_bar(color="#93c5fd")
-                      .encode(x=alt.X("Sector:N", sort=x_sort),
+                      .mark_bar(color="#3b82f6")
+                      .encode(x=alt.X("Sector:N", sort=x_sort,
+                                        axis=alt.Axis(labelAngle=-45)),
                               y=alt.Y("Count:Q", title="Number of stocks")))
             line = (alt.Chart(sector_df)
-                       .mark_line(color="#f87171", point=True)
-                       .encode(x=alt.X("Sector:N", sort=x_sort),
+                       .mark_line(color="#f97316", point=alt.OverlayMarkDef(color="#f97316"))
+                       .encode(x=alt.X("Sector:N", sort=x_sort,
+                                        axis=alt.Axis(labelAngle=-45)),
                                y=alt.Y("MC%:Q", title="% of total market cap")))
             chart = (alt.layer(bar, line)
                           .resolve_scale(y="independent")
